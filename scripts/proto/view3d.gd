@@ -9,7 +9,7 @@ const S := 0.05 # world units per map pixel
 const HILL_H := 2.6
 const RIVER_DEPTH := 0.55
 const WATER_Y := -0.2
-const CELL := 10.0 # map px per terrain grid cell
+const CELL := 6.0 # map px per terrain grid cell
 const MARGIN := 320.0 # ground beyond the map edge, so the horizon isn't a cliff
 const MAX_CORPSES := 600
 
@@ -26,6 +26,7 @@ var _parts := {} # part name -> MultiMesh
 var _corpse_mm: MultiMesh
 var _corpses: Array[Dictionary] = [] # { pos: Vector2, color: Color, face: Vector2 }
 var _font: Font
+var _cam_attr: CameraAttributesPractical # depth of field (Forward+ only)
 
 
 func _init(skirmish) -> void:
@@ -39,6 +40,7 @@ func _ready() -> void:
 	_build_water()
 	_build_bridge()
 	_build_trees_and_stones()
+	_build_grass()
 	_build_soldiers()
 	var mi := MeshInstance3D.new()
 	mi.mesh = _decals
@@ -47,6 +49,7 @@ func _ready() -> void:
 	cam = Camera3D.new()
 	cam.fov = 45.0
 	cam.far = 400.0
+	cam.attributes = _cam_attr
 	add_child(cam)
 	cam.make_current()
 	reset_camera()
@@ -136,6 +139,10 @@ func _place_camera() -> void:
 	var off := Vector3(sin(yaw) * cos(pitch), sin(pitch), cos(yaw) * cos(pitch)) * dist
 	cam.position = target + off
 	cam.look_at(target, Vector3.UP)
+	if _cam_attr != null:
+		# A touch of blur in the distance: the field looks like a table-top model
+		_cam_attr.dof_blur_far_distance = dist * 1.5
+		_cam_attr.dof_blur_far_transition = dist * 1.2
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -178,31 +185,64 @@ func _camera_keys(delta: float) -> void:
 
 # --- World building -------------------------------------------------------------
 
+## Forward+ gets the full treatment (ambient occlusion, glow, haze, soft
+## shadows, depth of field). Under the Compatibility renderer (no Vulkan)
+## those either don't exist or wash the colours out, so it stays plain.
+func _rich() -> bool:
+	return RenderingServer.get_current_rendering_method() != "gl_compatibility"
+
+
 func _build_environment() -> void:
 	var env := Environment.new()
 	env.background_mode = Environment.BG_SKY
 	var sky := Sky.new()
 	var sky_mat := ProceduralSkyMaterial.new()
-	sky_mat.sky_top_color = Color(0.36, 0.52, 0.72)
-	sky_mat.sky_horizon_color = Color(0.72, 0.76, 0.74)
+	sky_mat.sky_top_color = Color(0.32, 0.5, 0.74)
+	sky_mat.sky_horizon_color = Color(0.74, 0.78, 0.76)
 	sky_mat.ground_horizon_color = Color(0.5, 0.55, 0.45)
 	sky_mat.ground_bottom_color = Color(0.25, 0.3, 0.2)
+	sky_mat.sun_angle_max = 30.0
 	sky.sky_material = sky_mat
 	env.sky = sky
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
-	env.ambient_light_energy = 0.4
-	# Linear and no fog: under the Compatibility renderer, Filmic and fog wash the colours out
-	env.tonemap_mode = Environment.TONE_MAPPER_LINEAR
+	var sun := DirectionalLight3D.new()
+	sun.rotation = Vector3(deg_to_rad(-42.0), deg_to_rad(-35.0), 0.0)
+	sun.light_color = Color(1.0, 0.94, 0.84)
+	sun.shadow_enabled = true
+	sun.directional_shadow_max_distance = 110.0
+	if _rich():
+		env.ambient_light_energy = 0.55
+		env.tonemap_mode = Environment.TONE_MAPPER_ACES
+		env.tonemap_exposure = 1.05
+		env.ssao_enabled = true
+		env.ssao_radius = 1.2
+		env.ssao_intensity = 1.6
+		env.glow_enabled = true
+		env.glow_intensity = 0.35
+		env.glow_bloom = 0.04
+		env.fog_enabled = true
+		env.fog_light_color = Color(0.72, 0.78, 0.82)
+		env.fog_density = 0.0035
+		env.fog_aerial_perspective = 0.4
+		env.adjustment_enabled = true
+		env.adjustment_saturation = 1.12
+		env.adjustment_contrast = 1.05
+		sun.light_energy = 1.35
+		sun.shadow_blur = 1.5
+		sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
+	else:
+		env.ambient_light_energy = 0.4
+		env.tonemap_mode = Environment.TONE_MAPPER_LINEAR
+		sun.light_energy = 0.85
 	var we := WorldEnvironment.new()
 	we.environment = env
 	add_child(we)
-	var sun := DirectionalLight3D.new()
-	sun.rotation = Vector3(deg_to_rad(-48.0), deg_to_rad(-35.0), 0.0)
-	sun.light_energy = 0.85
-	sun.light_color = Color(1.0, 0.95, 0.85)
-	sun.shadow_enabled = true
-	sun.directional_shadow_max_distance = 120.0
 	add_child(sun)
+	if _rich():
+		var ca := CameraAttributesPractical.new()
+		ca.dof_blur_far_enabled = true
+		ca.dof_blur_amount = 0.06
+		_cam_attr = ca
 
 
 func _ground_color(p: Vector2, noise: FastNoiseLite) -> Color:
@@ -246,13 +286,9 @@ func _build_terrain() -> void:
 			st.add_index(a + nx + 1)
 			st.add_index(a + nx)
 	st.generate_normals()
-	var mat := StandardMaterial3D.new()
-	mat.vertex_color_use_as_albedo = true
-	mat.vertex_color_is_srgb = true
-	mat.roughness = 0.95
 	var mi := MeshInstance3D.new()
 	mi.mesh = st.commit()
-	mi.material_override = mat
+	mi.material_override = _terrain_material()
 	add_child(mi)
 
 
@@ -263,22 +299,83 @@ func _build_water() -> void:
 	var w := Terrain.STREAM_HALF_WIDTH + 6.0
 	while y <= View.MAP_SIZE.y + MARGIN:
 		var x := Terrain.stream_x(y)
-		st.set_normal(Vector3.UP)
-		st.add_vertex(Vector3((x - w) * S, WATER_Y, y * S))
-		st.set_normal(Vector3.UP)
-		st.add_vertex(Vector3((x + w) * S, WATER_Y, y * S))
-		y += 12.0
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.22, 0.42, 0.55, 0.78)
-	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	mat.roughness = 0.12
-	mat.metallic = 0.15
-	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+		for side in [-1.0, 1.0]:
+			st.set_normal(Vector3.UP)
+			st.set_uv(Vector2(0.5 + side * 0.5, y / 40.0))
+			st.add_vertex(Vector3((x + side * w) * S, WATER_Y, y * S))
+		y += 8.0
 	var mi := MeshInstance3D.new()
 	mi.mesh = st.commit()
-	mi.material_override = mat
+	mi.material_override = _water_material()
 	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(mi)
+
+
+## Ground: the vertex colours (grass, road, mud, forest floor) with a
+## two-scale noise on top, so close up it's not a flat smear.
+func _terrain_material() -> ShaderMaterial:
+	var sh := Shader.new()
+	sh.code = """
+shader_type spatial;
+uniform sampler2D detail : filter_linear_mipmap, repeat_enable;
+varying vec3 wpos;
+varying vec3 base;
+void vertex() {
+	wpos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	base = pow(COLOR.rgb, vec3(2.2)); // our colours are sRGB
+}
+void fragment() {
+	float n1 = texture(detail, wpos.xz * 0.11).r;
+	float n2 = texture(detail, wpos.xz * 0.53).r;
+	ALBEDO = base * (0.82 + 0.3 * n1) * (0.92 + 0.16 * n2);
+	ROUGHNESS = 0.95;
+	SPECULAR = 0.2;
+}
+"""
+	var noise := FastNoiseLite.new()
+	noise.frequency = 0.02
+	noise.fractal_octaves = 4
+	var tex := NoiseTexture2D.new()
+	tex.noise = noise
+	tex.seamless = true
+	tex.width = 256
+	tex.height = 256
+	var m := ShaderMaterial.new()
+	m.shader = sh
+	m.set_shader_parameter("detail", tex)
+	return m
+
+
+## Water: a deep-to-shallow tint, ripples running downstream, brighter
+## (and more opaque) at a glancing angle.
+func _water_material() -> ShaderMaterial:
+	var sh := Shader.new()
+	sh.code = """
+shader_type spatial;
+render_mode blend_mix, cull_disabled, depth_draw_always;
+uniform vec3 deep : source_color = vec3(0.10, 0.27, 0.38);
+uniform vec3 shallow : source_color = vec3(0.26, 0.50, 0.56);
+varying vec3 wpos;
+void vertex() {
+	wpos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+}
+void fragment() {
+	float t = TIME;
+	float a = sin(wpos.z * 1.7 - t * 1.6 + sin(wpos.x * 1.3 + t * 0.4) * 1.2);
+	float b = sin(wpos.z * 2.9 + wpos.x * 2.3 - t * 2.1);
+	NORMAL_MAP = normalize(vec3(0.5 + 0.025 * b, 0.5 + 0.035 * a, 1.0));
+	float edge = abs(UV.x - 0.5) * 2.0; // 0 mid-stream, 1 at the banks
+	float fres = pow(1.0 - clamp(dot(NORMAL, VIEW), 0.0, 1.0), 4.0);
+	ALBEDO = mix(deep, shallow, edge * 0.7 + 0.15 * a) + vec3(0.25) * fres;
+	ALPHA = mix(0.78, 0.96, fres) * mix(1.0, 0.85, edge);
+	ROUGHNESS = 0.06;
+	METALLIC = 0.0;
+	SPECULAR = 0.8;
+}
+"""
+	var m := ShaderMaterial.new()
+	m.shader = sh
+	return m
 
 
 func _build_bridge() -> void:
@@ -295,12 +392,30 @@ func _build_bridge() -> void:
 	wood.roughness = 0.9
 	var dark := StandardMaterial3D.new()
 	dark.albedo_color = Color(0.33, 0.23, 0.13)
-	var deck := MeshInstance3D.new()
-	var box := BoxMesh.new()
-	box.size = Vector3(length, 0.14, width)
-	deck.mesh = box
-	deck.material_override = wood
-	holder.add_child(deck)
+	# The deck: planks laid across, each a slightly different shade
+	var planks := 14
+	var plank := BoxMesh.new()
+	plank.size = Vector3(length / planks - 0.02, 0.12, width)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 21
+	for k in planks:
+		var pl := MeshInstance3D.new()
+		pl.mesh = plank
+		var m := StandardMaterial3D.new()
+		m.albedo_color = Color(0.5, 0.36, 0.22).darkened(rng.randf_range(-0.08, 0.2))
+		m.roughness = 0.9
+		pl.material_override = m
+		pl.position = Vector3(-length / 2.0 + (k + 0.5) * length / planks, rng.randf_range(-0.01, 0.01), 0)
+		holder.add_child(pl)
+	# Beams under the deck
+	for side in [-1.0, 1.0]:
+		var beam := MeshInstance3D.new()
+		var bb := BoxMesh.new()
+		bb.size = Vector3(length, 0.1, 0.12)
+		beam.mesh = bb
+		beam.material_override = dark
+		beam.position = Vector3(0, -0.1, side * width / 3.0)
+		holder.add_child(beam)
 	for side in [-1.0, 1.0]:
 		var rail := MeshInstance3D.new()
 		var rb := BoxMesh.new()
@@ -359,27 +474,64 @@ func _build_trees_and_stones() -> void:
 		for c in forest:
 			var center := Vector2(c[0], c[1])
 			var r: float = c[2]
-			for k in int(r * r / 260.0):
+			for k in int(r * r / 220.0):
 				spots.append(center + Vector2.RIGHT.rotated(rng.randf() * TAU) * sqrt(rng.randf()) * (r - 6.0))
+	var round_spots: Array[Vector2] = []
+	var pine_spots: Array[Vector2] = []
+	for p in spots:
+		if rng.randf() < 0.6:
+			round_spots.append(p)
+		else:
+			pine_spots.append(p)
+
 	var trunk := CylinderMesh.new()
 	trunk.top_radius = 0.06
 	trunk.bottom_radius = 0.1
 	trunk.height = 0.9
+	trunk.radial_segments = 6
+	var trunks := _multimesh(trunk, spots.size(), _colored())
+	# Round trees: a big crown and a smaller one offset, for a lumpy outline
 	var crown := SphereMesh.new()
 	crown.radius = 0.62
-	crown.height = 1.5
-	crown.radial_segments = 10
-	crown.rings = 6
-	var trunks := _multimesh(trunk, spots.size(), _colored())
-	var crowns := _multimesh(crown, spots.size(), _colored(0.9))
-	for i in spots.size():
-		var p := spots[i]
-		var sc := rng.randf_range(0.55, 0.85) # trees a few men tall, not giants
+	crown.height = 1.3
+	crown.radial_segments = 12
+	crown.rings = 7
+	var crowns := _multimesh(crown, round_spots.size() * 2, _colored(0.9))
+	# Pines: three stacked cones
+	var cone := CylinderMesh.new()
+	cone.top_radius = 0.0
+	cone.bottom_radius = 0.55
+	cone.height = 0.9
+	cone.radial_segments = 9
+	var cones := _multimesh(cone, pine_spots.size() * 3, _colored(0.9))
+
+	var ti := 0
+	for k in round_spots.size():
+		var p := round_spots[k]
+		var sc := rng.randf_range(0.55, 0.85)
 		var base := ground(p)
-		trunks.set_instance_transform(i, Transform3D(Basis().scaled(Vector3.ONE * sc), base + Vector3(0, 0.45 * sc, 0)))
-		trunks.set_instance_color(i, Color(0.36, 0.26, 0.17))
-		crowns.set_instance_transform(i, Transform3D(Basis().scaled(Vector3.ONE * sc), base + Vector3(0, 1.35 * sc, 0)))
-		crowns.set_instance_color(i, Color(0.16, 0.36, 0.17).lerp(Color(0.27, 0.46, 0.22), rng.randf()))
+		trunks.set_instance_transform(ti, Transform3D(Basis().scaled(Vector3.ONE * sc), base + Vector3(0, 0.45 * sc, 0)))
+		trunks.set_instance_color(ti, Color(0.36, 0.26, 0.17))
+		ti += 1
+		var green := Color(0.16, 0.36, 0.17).lerp(Color(0.3, 0.48, 0.2), rng.randf())
+		crowns.set_instance_transform(k * 2, Transform3D(Basis().scaled(Vector3.ONE * sc), base + Vector3(0, 1.3 * sc, 0)))
+		crowns.set_instance_color(k * 2, green)
+		var off := Vector3(rng.randf_range(-0.3, 0.3), 0, rng.randf_range(-0.3, 0.3)) * sc
+		crowns.set_instance_transform(k * 2 + 1, Transform3D(Basis().scaled(Vector3.ONE * sc * 0.7), base + Vector3(0, 1.75 * sc, 0) + off))
+		crowns.set_instance_color(k * 2 + 1, green.lightened(0.08))
+	for k in pine_spots.size():
+		var p := pine_spots[k]
+		var sc := rng.randf_range(0.6, 0.95)
+		var base := ground(p)
+		trunks.set_instance_transform(ti, Transform3D(Basis().scaled(Vector3.ONE * sc), base + Vector3(0, 0.45 * sc, 0)))
+		trunks.set_instance_color(ti, Color(0.32, 0.22, 0.14))
+		ti += 1
+		var green := Color(0.1, 0.27, 0.16).lerp(Color(0.17, 0.36, 0.2), rng.randf())
+		for j in 3:
+			var shrink := 1.0 - j * 0.25
+			cones.set_instance_transform(k * 3 + j, Transform3D(Basis().scaled(Vector3(shrink, 1.0, shrink) * sc), base + Vector3(0, (0.85 + j * 0.45) * sc, 0)))
+			cones.set_instance_color(k * 3 + j, green.lightened(j * 0.05))
+
 	# Stones in the grass
 	var stone := SphereMesh.new()
 	stone.radius = 0.14
@@ -387,7 +539,7 @@ func _build_trees_and_stones() -> void:
 	stone.radial_segments = 6
 	stone.rings = 3
 	var stones: Array[Vector2] = []
-	while stones.size() < 90:
+	while stones.size() < 110:
 		var p := Vector2(rng.randf() * View.MAP_SIZE.x, rng.randf() * View.MAP_SIZE.y)
 		if not (Terrain.in_stream(p) or Terrain.in_forest(p) or Terrain.on_road(p)):
 			stones.append(p)
@@ -396,6 +548,68 @@ func _build_trees_and_stones() -> void:
 		var sc := rng.randf_range(0.6, 1.8)
 		smm.set_instance_transform(i, Transform3D(Basis().rotated(Vector3.UP, rng.randf() * TAU).scaled(Vector3(sc, sc * 0.7, sc)), ground(stones[i], 0.02)))
 		smm.set_instance_color(i, Color(0.55, 0.55, 0.52).darkened(rng.randf() * 0.2))
+
+
+## Thousands of grass tufts that sway in the wind (none on the road, in
+## the water or on the bridge; thin under the trees).
+func _build_grass() -> void:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 5
+	# One tuft: five thin blades, each a triangle, leaning a little
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	for k in 5:
+		var a := rng.randf() * TAU
+		var side := Vector3(cos(a), 0, sin(a)) * 0.03
+		var at := Vector3(rng.randf_range(-0.08, 0.08), 0, rng.randf_range(-0.08, 0.08))
+		var lean := Vector3(rng.randf_range(-0.06, 0.06), 0, rng.randf_range(-0.06, 0.06))
+		var h := rng.randf_range(0.15, 0.26)
+		for v in [[at - side, 0.0], [at + side, 0.0], [at + lean + Vector3(0, h, 0), 1.0]]:
+			st.set_normal(Vector3.UP)
+			st.set_uv(Vector2(0.5, v[1]))
+			st.add_vertex(v[0])
+	var tuft := st.commit()
+	var sh := Shader.new()
+	sh.code = """
+shader_type spatial;
+render_mode cull_disabled, specular_disabled;
+uniform vec3 root : source_color = vec3(0.3, 0.45, 0.2);
+uniform vec3 tip : source_color = vec3(0.55, 0.7, 0.32);
+varying vec3 tint;
+void vertex() {
+	tint = COLOR.rgb;
+	NORMAL = vec3(0.0, 1.0, 0.0); // lit like the ground, whichever way a blade faces
+	vec3 wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	float sway = sin(TIME * 1.6 + wp.x * 0.7 + wp.z * 0.5) * 0.07 + sin(TIME * 3.3 + wp.x * 2.1) * 0.025;
+	VERTEX.x += sway * UV.y;
+	VERTEX.z += sway * 0.6 * UV.y;
+}
+void fragment() {
+	// Both faces of a blade lit as if facing up (Godot flips back faces' normals)
+	NORMAL = normalize((VIEW_MATRIX * vec4(0.0, 1.0, 0.0, 0.0)).xyz);
+	ALBEDO = mix(root, tip, UV.y) * tint;
+	ROUGHNESS = 0.9;
+}
+"""
+	var mat := ShaderMaterial.new()
+	mat.shader = sh
+	var count := 14000
+	var spots: Array[Vector3] = []
+	var tries := 0
+	while spots.size() < count and tries < count * 3:
+		tries += 1
+		var p := Vector2(rng.randf_range(-60.0, View.MAP_SIZE.x + 60.0), rng.randf_range(-60.0, View.MAP_SIZE.y + 60.0))
+		if Terrain.in_stream(p) or Terrain.on_road(p) or Terrain.on_bridge(p) or _carve(p) > 0.05:
+			continue
+		if Terrain.in_forest(p) and rng.randf() < 0.7:
+			continue
+		spots.append(Vector3(p.x, p.y, rng.randf()))
+	var mm := _multimesh(tuft, spots.size(), mat, false)
+	for i in spots.size():
+		var p := Vector2(spots[i].x, spots[i].y)
+		var sc := rng.randf_range(0.7, 1.3)
+		mm.set_instance_transform(i, Transform3D(Basis(Vector3.UP, rng.randf() * TAU).scaled(Vector3.ONE * sc), ground(p)))
+		mm.set_instance_color(i, Color(1, 1, 1).lerp(Color(1.15, 1.05, 0.8), spots[i].z * 0.6))
 
 
 func _build_soldiers() -> void:

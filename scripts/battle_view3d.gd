@@ -15,6 +15,8 @@ var _flags: MultiMesh
 var _riders: MultiMesh
 var _houses: Array = [] # per objective: Array of { body, roof, flame }
 var _house_mats := {}
+var _last_pos := {} # Man -> where he stood last frame, to tell who's walking
+var _gait := {} # Man -> walk cycle phase
 
 
 func _init(the_battle) -> void:
@@ -26,7 +28,7 @@ func _init(the_battle) -> void:
 func _build_soldiers() -> void:
 	var body := CapsuleMesh.new()
 	body.radius = 0.17
-	body.height = 0.62
+	body.height = 0.58
 	body.radial_segments = 8
 	body.rings = 2
 	var head := SphereMesh.new()
@@ -48,6 +50,13 @@ func _build_soldiers() -> void:
 	_parts.head = _multimesh(head, MAX_MEN, _colored(0.35, 0.6))
 	_parts.shield = _multimesh(shield, MAX_MEN, _colored(0.7))
 	_parts.spear = _multimesh(spear, MAX_MEN, _colored(0.9))
+	var leg := CapsuleMesh.new()
+	leg.radius = 0.06
+	leg.height = 0.36
+	leg.radial_segments = 6
+	leg.rings = 1
+	_parts.leg_l = _multimesh(leg, MAX_MEN, _colored(0.85))
+	_parts.leg_r = _multimesh(leg, MAX_MEN, _colored(0.85))
 	for p in _parts.values():
 		p.visible_instance_count = 0
 	var lying := CapsuleMesh.new()
@@ -205,6 +214,8 @@ func squad_in_screen_rect(s: Squad, rect: Rect2) -> bool:
 func _update_soldiers() -> void:
 	var i := 0
 	var banners := 0
+	var dt := get_process_delta_time()
+	var seen := {}
 	for s in sim.squads:
 		if not is_instance_valid(s) or s.concealed:
 			continue
@@ -221,19 +232,36 @@ func _update_soldiers() -> void:
 			var fwd := Vector3(face.x, 0.0, face.y)
 			if fwd.length() < 0.01:
 				fwd = Vector3.RIGHT
-			var t := Transform3D(Basis.looking_at(fwd.normalized(), Vector3.UP), ground(m.pos))
+			# Walking? Swing the legs and bob, in step with how fast he's going
+			var last: Vector2 = _last_pos.get(m, m.pos)
+			var speed := last.distance_to(m.pos) / maxf(dt, 0.001)
+			_last_pos[m] = m.pos
+			seen[m] = true
+			var phase: float = _gait.get(m, randf() * TAU)
+			var walking := speed > 8.0 and not get_tree().paused
+			if walking:
+				phase += dt * clampf(speed * 0.16, 6.0, 14.0)
+			_gait[m] = phase
+			var stride := sin(phase) * (0.55 if walking else 0.0)
+			var bob := absf(sin(phase)) * 0.05 if walking else 0.0
+			var t := Transform3D(Basis.looking_at(fwd.normalized(), Vector3.UP), ground(m.pos, bob))
 			var c := base_c.lerp(Color.WHITE, 0.75) if m.flash > 0.0 else base_c
+			var trousers := c.darkened(0.45)
+			_parts.leg_l.set_instance_transform(i, t * Transform3D(Basis(Vector3.RIGHT, stride), Vector3(-0.07, 0.17 - bob, 0)))
+			_parts.leg_l.set_instance_color(i, trousers)
+			_parts.leg_r.set_instance_transform(i, t * Transform3D(Basis(Vector3.RIGHT, -stride), Vector3(0.07, 0.17 - bob, 0)))
+			_parts.leg_r.set_instance_color(i, trousers)
 			var thrust := sin(m.swing / Squad.SWING_ANIM * PI) * 0.22 if m.swing > 0.0 else 0.0
 			var level := -1.25 if m.target != null else -0.3 # leveled to fight, sloped to march
 			if s.routing:
 				level = 0.25
-			_parts.body.set_instance_transform(i, t * Transform3D(Basis(), Vector3(0, 0.38, 0)))
+			_parts.body.set_instance_transform(i, t * Transform3D(Basis(), Vector3(0, 0.5, 0)))
 			_parts.body.set_instance_color(i, c)
-			_parts.head.set_instance_transform(i, t * Transform3D(Basis(), Vector3(0, 0.8, 0)))
+			_parts.head.set_instance_transform(i, t * Transform3D(Basis(), Vector3(0, 0.92, 0)))
 			_parts.head.set_instance_color(i, Color.WHITE if m.flash > 0.0 else Color(0.58, 0.59, 0.62))
-			_parts.shield.set_instance_transform(i, t * Transform3D(Basis(Vector3.RIGHT, PI / 2.0), Vector3(0.11, 0.45, -0.19)))
+			_parts.shield.set_instance_transform(i, t * Transform3D(Basis(Vector3.RIGHT, PI / 2.0), Vector3(0.11, 0.55, -0.19)))
 			_parts.shield.set_instance_color(i, c.darkened(0.35))
-			_parts.spear.set_instance_transform(i, t * Transform3D(Basis(Vector3.RIGHT, level), Vector3(-0.15, 0.55, -0.12 - thrust)))
+			_parts.spear.set_instance_transform(i, t * Transform3D(Basis(Vector3.RIGHT, level), Vector3(-0.15, 0.65, -0.12 - thrust)))
 			_parts.spear.set_instance_color(i, Color(0.5, 0.38, 0.24))
 			i += 1
 		# Banner just behind the block
@@ -252,6 +280,12 @@ func _update_soldiers() -> void:
 			banners += 1
 	for p in _parts.values():
 		p.visible_instance_count = i
+	# Forget the fallen and the departed
+	if _last_pos.size() > seen.size() + 64:
+		for m in _last_pos.keys():
+			if not seen.has(m):
+				_last_pos.erase(m)
+				_gait.erase(m)
 	_poles.visible_instance_count = banners
 	_flags.visible_instance_count = banners
 
