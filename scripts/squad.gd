@@ -1,5 +1,11 @@
 class_name Squad
 extends Node2D
+## A squad: one leader's soldiers in a block. Orders go to the squad; the
+## fighting is man by man. Every soldier has his own health and swings on his
+## own timer, but keeps his place in the block: only the men at the edge that
+## touches an enemy step out (a short lunge) to fight. A blow's direction is
+## judged against the struck block's facing, so flanks and rears pay off, and a
+## block locked in melee can't wheel round to face a new threat.
 
 signal died(squad: Squad) # removed from the battle (wiped out or fled the map)
 signal routed(squad: Squad) # broke and started fleeing
@@ -26,14 +32,27 @@ const SOLDIER_RADIUS := 4.0
 const SPACING := 12.0
 const COLUMNS := 5 # soldiers per rank (formation width)
 
-# --- Combat tuning ---
-const ENGAGE_GAP := 8.0 # formations closer than this (edge to edge) are in melee
-const DAMAGE_PER_SOLDIER := 0.03 # enemy casualties per soldier per second (lower = longer fights)
-const ENGAGED_SPEED_MULT := 0.3 # squads in melee can only shuffle slowly
-const ENGAGED_TURN_SPEED := 1.5 # and turn slowly, so flanks pay off
-const SIDE_MULT := 1.5 # damage multiplier when hit from the side
-const REAR_MULT := 2.5 # damage multiplier when hit from behind
-const FLASH_TIME := 0.15
+# --- Soldiers -----------------------------------------------------------------
+const MAN_HP := 10.0
+const MAN_SPEED := 75.0 # how fast a soldier walks to his place (px/s), on top of the squad's pace
+const REACH := 12.0 # melee range, centre to centre
+const LUNGE := 7.0 # how far a man steps out of his place to fight
+const SWING_TIME := 1.0 # seconds between a man's swings (each jittered)
+const HIT_CHANCE := 0.5
+const SIDE_MULT := 1.5 # damage from the side of the block...
+const REAR_MULT := 2.5 # ...and from behind
+const SIDE_HIT_BONUS := 0.12 # easier to land on men not facing you
+const REAR_HIT_BONUS := 0.25
+const RETARGET_TIME := 0.3
+const FOE_GAP := 8.0 # men of opposing sides never stand closer than this
+const MAX_SHOVE := 30.0 # px/s: how fast blocks pressing on each other give way
+const FLASH_TIME := 0.12
+const SWING_ANIM := 0.22
+
+# --- Squads in melee ------------------------------------------------------------
+const SLIDE_SPEED := 0.3 # speed fraction while edging round to our side, fighting
+const SLIDE_DONE := 14.0 # px from our contact spot counts as in place
+const SIDE_REPICK := 0.5 # seconds between re-choosing which side of the target to take
 
 # --- Morale tuning ---
 const MAX_MORALE := 100.0
@@ -41,11 +60,12 @@ const ROUT_THRESHOLD := 15.0 # break and flee below this
 const STEADY_ROUT_THRESHOLD := 5.0 # ...or this, under a Steady leader
 const INSPIRING_RADIUS := 150.0
 const INSPIRING_REGEN := 0.9 # morale/s for allies near an Inspiring leader
-const MORALE_PER_CASUALTY := 8.0 # lost for each soldier who falls
-const MORALE_ENGAGED_DRAIN := 0.95 # per second just from being in melee (scaled with damage)
-const MORALE_FLANK_DRAIN := 5.25 # per second, scaled by (flank mult - 1) (scaled with damage)
+const MORALE_PER_CASUALTY := 10.0 # lost for each soldier who falls (x 10 / starting size)
+const MORALE_ENGAGED_DRAIN := 0.6 # per second just from being in melee
+const MORALE_FLANK_DRAIN := 3.0 # per second while hit in the flank (x1.6 from the rear)
+const FLANK_SHOW := 1.2 # seconds the flank marker lingers after the last flank hit
 const MORALE_RECOVERY := 4.0 # per second while out of combat
-const ROUT_SHOCK := 20.0 # lost by nearby allies when a squad routs
+const ROUT_SHOCK := 15.0 # lost by nearby allies when a squad routs
 const ROUT_SHOCK_RADIUS := 150.0
 const FLEE_SPEED_MULT := 1.3 # routers run faster than pursuers walk
 const PLANNED_CHARGE_SHOCK := 20.0 # morale hit on first contact of a planned attack
@@ -54,54 +74,100 @@ const FAMILIARITY_COMMAND_BONUS := 5.0 # extra effective Command at familiarity 
 const WOUNDED_CHANCE := 0.5 # share of casualties who are wounded rather than killed
 const WOUNDED_CHANCE_FLEEING := 0.25 # men cut down while running mostly die
 
-# --- Individual soldiers (how the melee looks) ---
-const MAN_SPEED := 75.0 # how fast a soldier walks to his spot (px/s)
+# --- Orders, rallying, the Commander ---------------------------------------------
 const WITHDRAW_TIME := 1.6 # seconds a withdrawing squad ignores the fight and moves at full speed
 const WITHDRAW_MORALE := 8.0 # turning your back on the enemy costs nerve
 const REFORM_TIME := 1.2 # the enemy we left needs this long before it can follow
-const ENGAGE_RELEASE := 14.0 # stay in melee until the gap grows this much past ENGAGE_GAP
-const MELEE_LINGER := 0.6 # seconds the men keep their melee spots after contact breaks
 const RALLY_MORALE := 60.0 # morale of a fleeing squad that reaches the Commander's circle
 const RALLY_SPEED_MULT := 1.15 # rallying men hurry to the Commander
 const RALLY_JOIN_GAP := 16.0 # close enough to the Commander's squad to fall in
-const ENVELOP_DAMAGE := 0.4 # up to +40% damage when we clearly outnumber our target
-const ENVELOP_MORALE := 6.0 # up to this much extra morale drain per second on them
 const COMMANDER_AURA_RADIUS := 160.0
 const COMMANDER_AURA_REGEN := 0.75 # morale per second for allies near the commander, even in melee
 const COMMANDER_LAST_STAND := 3 # the Commander only breaks once the guard is down to this
 const COMMANDER_GUARD_DAMAGE := 2.0 # elite bodyguard hits twice as hard
-const COMMANDER_GUARD_TOUGHNESS := 0.5 # ...and takes half the losses
+const COMMANDER_GUARD_TOUGHNESS := 0.5 # ...and takes half the damage
 const RALLY_MORALE_COST := 10.0 # Commander's squad morale lost when shaken routers join
+
+const GRID := 24.0
+
+
+## One soldier on the field.
+class Man:
+	var pos: Vector2
+	var home := Vector2.ZERO # his place in the block this frame
+	var hp := 10.0
+	var cool := 0.0
+	var swing := 0.0 # > 0 while the thrust animation plays
+	var flash := 0.0
+	var target: Man = null
+	var retarget := 0.0
+	var alive := true
+	var sq: Squad
+
+
+## Every man on the field by grid cell, rebuilt once a frame by the battle
+## (before the squads move) so each man can find foes near him quickly.
+static var grid := {}
+
+
+static func build_grid(all: Array[Squad]) -> void:
+	grid.clear()
+	for s in all:
+		if not is_instance_valid(s):
+			continue
+		for m in s._m:
+			var k := Vector2i(floori(m.pos.x / GRID), floori(m.pos.y / GRID))
+			if not grid.has(k):
+				grid[k] = []
+			grid[k].append(m)
+
+
+## Living men of `team` (-1: anyone) within `r` of `p`.
+static func men_near(p: Vector2, r: float, team_of: int) -> Array[Man]:
+	var out: Array[Man] = []
+	var a := Vector2i(floori((p.x - r) / GRID), floori((p.y - r) / GRID))
+	var b := Vector2i(floori((p.x + r) / GRID), floori((p.y + r) / GRID))
+	for gx in range(a.x, b.x + 1):
+		for gy in range(a.y, b.y + 1):
+			for o: Man in grid.get(Vector2i(gx, gy), []):
+				if o.alive and is_instance_valid(o.sq) and (team_of < 0 or o.sq.team == team_of) \
+						and o.pos.distance_to(p) <= r:
+					out.append(o)
+	return out
+
 
 var target_position: Vector2
 var target_facing: float = 0.0
 var has_target_facing := false
 var attack_target: Squad = null
+## The squad most of our men are fighting right now (null: not in melee).
 var engaged_with: Squad = null
+var in_contact := false
 var morale := MAX_MORALE
 var routing := false
 
 ## Our side only: the leader and the soldiers (Soldier records). members[i]
-## is the man standing at _men[i].
+## is the man _m[i].
 var leader: Leader = null
 var members: Array[Soldier] = []
-var _men := PackedVector2Array() # where each soldier actually stands (global)
-var _ring := PackedInt32Array() # each man's place in the melee ring (-1 = none yet)
-var _melee_foe: Squad = null # the squad our men are currently wrapped around
-var _melee_base := 0.0 # direction of first contact (fixed for the whole fight)
-var _melee_off := Vector2.ZERO # ring centre relative to the foe's origin, fixed at contact
-var _melee_linger := 0.0
-## Rallying: a squad that fled into the Commander's circle walks back to the
-## Commander and joins its squad. Only once per squad.
+var _m: Array[Man] = []
+var _fighting := 0 # men with a foe in reach, last frame
+var attack_dir := Vector2.ZERO # which side of the attack target we close on (from its middle)
+var _side_timer := 0.0
+## Flank feedback: > 0 when hit in the flank or rear recently
+var flank_t := 0.0
+var flank_dir := Vector2.ZERO # from our middle toward whoever is flanking us
+var flank_rear := false
+var _sparks: Array[Dictionary] = [] # { pos, left, flank } where our men were struck
 var withdrawing := 0.0 # time left pulling out of a fight
 var _reform := 0.0 # time left re-forming after the enemy pulled away
+## Rallying: a squad that fled into the Commander's circle walks back to the
+## Commander and joins its squad. Only once per squad.
 var rallying := false
 var _rallied_once := false
 var _rally_to: Squad = null
 var _start_count := 0 # soldiers at the start of battle, for morale scaling
 var _planned_charge := false # next contact with attack_target is a planned surprise
-var _incoming := 0.0 # fractional casualties waiting to become whole soldiers
-var _flash := 0.0
 
 ## Unscouted enemy during planning: drawn as an unknown block, size hidden.
 var concealed := false:
@@ -125,31 +191,37 @@ func _ready() -> void:
 	target_position = global_position
 
 
+func _exit_tree() -> void:
+	for m in _m:
+		m.alive = false # nobody keeps fighting a ghost
+
+
 func _process(delta: float) -> void:
 	if routing:
 		_flee(delta)
 	else:
-		if attack_target != null and (not is_instance_valid(attack_target) or attack_target.soldier_count <= 0):
+		if attack_target != null and (not is_instance_valid(attack_target) or attack_target.soldier_count <= 0 or attack_target.routing):
 			attack_target = null
+			attack_dir = Vector2.ZERO
 			target_position = global_position
+			has_target_facing = false
 		if rallying:
 			_rally_step()
-		if attack_target != null:
-			target_position = attack_target.global_position
-
 		if withdrawing > 0.0:
 			withdrawing -= delta
-			engaged_with = null # backs turned: no fighting back while pulling out
-		else:
-			engaged_with = _find_engaged_enemy()
+
+	_update_men(delta)
+
+	if not routing:
 		if engaged_with != null:
 			if _planned_charge and engaged_with == attack_target:
 				_planned_charge = false
 				engaged_with.morale_shock(PLANNED_CHARGE_SHOCK * (2.0 if has_trait("Ambusher") else 1.0))
-			_fight(delta)
 			morale -= MORALE_ENGAGED_DRAIN * delta
 		else:
 			morale = minf(MAX_MORALE, morale + MORALE_RECOVERY * (0.5 + stat("charisma") / 100.0) * delta)
+		if flank_t > FLANK_SHOW - 0.5:
+			morale -= MORALE_FLANK_DRAIN * (1.6 if flank_rear else 1.0) * (0.5 if is_commander else 1.0) * delta
 		if _near_inspiring_leader():
 			morale = minf(MAX_MORALE, morale + INSPIRING_REGEN * delta)
 		if _near_own_commander():
@@ -158,193 +230,190 @@ func _process(delta: float) -> void:
 		_check_rout()
 	_dry_out()
 
-	_update_men(delta)
-	if _flash > 0.0:
-		_flash -= delta
+	flank_t = maxf(0.0, flank_t - delta)
+	for i in range(_sparks.size() - 1, -1, -1):
+		_sparks[i].left -= delta
+		if _sparks[i].left <= 0.0:
+			_sparks.remove_at(i)
 	queue_redraw() # soldiers and morale bar change every frame
 
 
-# --- Individual soldiers ---------------------------------------------------
-# Out of combat every soldier walks to his place in the formation. In melee
-# they spread out around the enemy squad: the first ones at the point of
-# contact, the rest fanning out to both sides, and with enough men a second
-# ring, so a big squad visibly surrounds a small one.
+# --- Soldiers -----------------------------------------------------------------
 
-## Keep one position per soldier. snap = put everyone straight in formation.
+## Keep one Man per soldier. snap = put everyone straight in formation.
 func _sync_men(snap: bool) -> void:
-	while _men.size() < soldier_count:
-		_men.append(to_global(_slot(_men.size())))
-		_ring.append(-1)
-	if _men.size() > soldier_count:
-		_men.resize(soldier_count)
-		_ring.resize(soldier_count)
+	while _m.size() < soldier_count:
+		var m := Man.new()
+		m.sq = self
+		m.hp = MAN_HP
+		m.cool = randf_range(0.0, SWING_TIME)
+		m.pos = to_global(_slot(_m.size()))
+		m.home = m.pos
+		_m.append(m)
+	while _m.size() > soldier_count:
+		_m.pop_back().alive = false
 	if snap:
-		for i in soldier_count:
-			_men[i] = to_global(_slot(i))
+		for i in _m.size():
+			_m[i].pos = to_global(_slot(i))
+			_m[i].home = _m[i].pos
 
 
-## How many of a squad of `mine` men fight in its front row against `theirs`.
-static func _frontage(mine: int, theirs: int) -> int:
-	return mini(mine, maxi(3, ceili(theirs * 0.6)))
-
-
-## Melee place number `rank` (0 = first in line) for a fight against `foe`.
-## Both sides meet at a contact line between them and stand on their own side
-## of it: our front row against the line, the rest in rows behind. Only when we
-## outnumber them do the extra men go round their flanks and close in behind.
-func _melee_point(foe: Squad, rank: int) -> Vector2:
-	var n := soldier_count
-	var f := foe.soldier_count
-	var u := Vector2.RIGHT.rotated(_melee_base) # from them toward us
-	var v := u.orthogonal()
-	# Contact line: halfway across the gap between the two formations, so both
-	# sides compute the same line and each stands on its own side of it.
-	# (Anchored to their origin so it doesn't swing about when they turn.)
-	var gap := center().distance_to(foe.center()) - radius() - foe.radius()
-	var reach := foe.radius() + maxf(gap, 0.0) * 0.5
-	if foe._attacker_count() >= 2:
-		# They've closed up into a block: keep clear of its corners
-		reach = maxf(reach, foe.radius() * 1.25 + 2.0)
-	var contact := foe.global_position + _melee_off + u * reach
-	var sp := SPACING * 0.95
-	var front := _frontage(n, f)
-	var wrap := clampi(n - f, 0, n - front) # only the men we have to spare
-	var their_front := _frontage(f, n)
-	var their_half := (their_front - 1) * 0.5 * sp
-
-	if rank < front:
-		# Front row, filled from the middle outward
-		var side := 1.0 if rank % 2 == 1 else -1.0
-		var off := side * int((rank + 1) / 2.0) * sp
-		if front % 2 == 0:
-			off += sp * 0.5
-		return contact + u * 5.0 + v * off
-	rank -= front
-	if rank < wrap:
-		# Round their flanks: down each side, then in behind them
-		var side := 1.0 if rank % 2 == 0 else -1.0
-		var j := int(rank / 2.0)
-		var depth := foe.radius() * 2.0 + sp
-		var along := (j + 1) * sp
-		if along <= depth:
-			return contact - u * along + v * side * (their_half + sp)
-		var inward := along - depth
-		return contact - u * depth + v * side * maxf(0.0, their_half + sp - inward)
-	rank -= wrap
-	# Everyone else: rows behind our front row
-	var row := 1 + int(rank / float(front))
-	var col := rank % front
-	var off2 := (col - (front - 1) * 0.5) * sp
-	return contact + u * (5.0 + row * sp) + v * off2
-
-
+## Each frame: every man finds his place in the block, picks a foe in reach
+## (unless we're pulling out), steps out to him and swings. Also works out
+## who we're mainly fighting, and shoves our block off enemy blocks.
 func _update_men(delta: float) -> void:
 	_sync_men(false)
-	var foe: Squad = null
-	if not routing and engaged_with != null and is_instance_valid(engaged_with):
-		foe = engaged_with
-	# Keep the melee picture for a moment after contact breaks (no snapping)
-	if foe == null and _melee_foe != null and is_instance_valid(_melee_foe) and not routing:
-		_melee_linger -= delta
-		if _melee_linger > 0.0:
-			foe = _melee_foe
-	if foe != null and foe == engaged_with:
-		_melee_linger = MELEE_LINGER
-	if foe != _melee_foe:
-		_start_melee(foe)
+	var n := _m.size()
+	var fighting := 0
+	var foes := {}
+	var shove := Vector2.ZERO
+	var pace := MAN_SPEED + move_speed * (FLEE_SPEED_MULT if routing else 1.0)
+	for i in n:
+		var m := _m[i]
+		m.home = to_global(_slot(i))
+		m.swing = maxf(0.0, m.swing - delta)
+		m.flash = maxf(0.0, m.flash - delta)
+		if routing or withdrawing > 0.0:
+			m.target = null # backs turned: no fighting back
+		else:
+			_choose_target(m, delta)
+		var want := m.home
+		if m.target != null:
+			fighting += 1
+			foes[m.target.sq] = int(foes.get(m.target.sq, 0)) + 1
+			var to := m.target.pos - m.home
+			var d := to.length()
+			# Step out of his place toward the foe, but only so far
+			want = m.home + to / maxf(d, 0.01) * clampf(d - REACH + 2.0, 0.0, LUNGE)
+			_swing(m, delta)
+		m.pos = m.pos.move_toward(want, pace * delta)
+		if m.target != null:
+			# The lines meet, they don't mesh: never stand inside a foe, and
+			# where two blocks overlap, our block gives way a little
+			for e in men_near(m.pos, SPACING, 1 - team):
+				var off := m.pos - e.pos
+				var dd := maxf(off.length(), 0.01)
+				if dd < FOE_GAP:
+					m.pos += off / dd * (FOE_GAP - dd) * 0.5
+				var hoff := m.home - e.home
+				var hd := maxf(hoff.length(), 0.01)
+				if hd < SPACING - 1.0:
+					shove += hoff / hd * (SPACING - 1.0 - hd)
+	_fighting = fighting
+	in_contact = fighting > 0
+	var best: Squad = null
+	var most := 0
+	for f in foes:
+		if is_instance_valid(f) and foes[f] > most:
+			most = foes[f]
+			best = f
+	engaged_with = best
+	if shove != Vector2.ZERO and not routing:
+		var v := shove / sqrt(maxf(n, 1.0)) * minf(1.0, 12.0 * delta)
+		_step(v.limit_length(MAX_SHOVE * delta))
 
-	var step := MAN_SPEED * delta
-	# Attacked from two or more sides: close up in our own formation and
-	# hold together instead of forming a line against just one of them
-	if foe != null and _attacker_count() >= 2:
-		foe = null
-	if foe == null:
-		for i in soldier_count:
-			_men[i] = _men[i].move_toward(to_global(_slot(i)), step + move_speed * delta)
+
+## The man picks a foe within reach of his place (plus a short lunge),
+## keeping the one he has while it lasts. Runners only get cut down if they
+## pass close; nobody fights across the water.
+func _choose_target(m: Man, delta: float) -> void:
+	m.retarget -= delta
+	var reach := REACH + LUNGE
+	var t := m.target
+	var ok := t != null and t.alive and is_instance_valid(t.sq) and not t.sq.routing \
+		and m.home.distance_to(t.pos) <= reach + 2.0
+	if ok and m.retarget > 0.0:
 		return
-	for i in soldier_count:
-		if _ring[i] < 0:
-			_ring[i] = _next_ring_place()
-	# Places are handed out in order of each man's fixed number, so when a man
-	# falls the ones behind him step up one place (closing ranks) instead of
-	# everyone reshuffling
-	var order := range(soldier_count)
-	order.sort_custom(func(a: int, b: int) -> bool: return _ring[a] < _ring[b])
-	for rank in order.size():
-		var i: int = order[rank]
-		_men[i] = _men[i].move_toward(_melee_point(foe, rank), step)
+	m.retarget = RETARGET_TIME * randf_range(0.8, 1.2)
+	var best: Man = null
+	var best_score := INF
+	for e in men_near(m.home, reach, 1 - team):
+		if e.sq.routing and e.pos.distance_to(m.pos) > REACH + 4.0:
+			continue
+		if not _reachable(m.pos, e.pos):
+			continue
+		var score := m.home.distance_to(e.pos) + (6.0 if e != m.target else 0.0)
+		if score < best_score:
+			best_score = score
+			best = e
+	m.target = best
 
 
-## A new fight: fix the contact direction and hand out ring places once,
-## nearest man to the contact point first. Places are then kept for the
-## whole fight, so nobody shuffles when a neighbour falls.
-func _start_melee(foe: Squad) -> void:
-	_melee_foe = foe
-	for i in soldier_count:
-		_ring[i] = -1
-	if foe == null:
+## Same bank, or one of them is on a crossing.
+static func _reachable(a: Vector2, b: Vector2) -> bool:
+	return Terrain.bank_side(a) == Terrain.bank_side(b) or Terrain.on_crossing(a) or Terrain.on_crossing(b)
+
+
+func _swing(m: Man, delta: float) -> void:
+	m.cool -= delta
+	var t := m.target
+	if m.cool > 0.0 or m.pos.distance_to(t.pos) > REACH + 1.5:
 		return
-	_melee_base = (center() - foe.center()).angle()
-	_melee_off = foe.center() - foe.global_position
-	# Another of our squads already fighting this foe from about the same side?
-	# Then take the flank instead of crowding into the same spot.
-	var taken: Array[float] = []
-	for node in get_tree().get_nodes_in_group("squads"):
-		var ally := node as Squad
-		if ally != null and ally != self and ally.team == team and ally._melee_foe == foe and is_instance_valid(foe):
-			taken.append(ally._melee_base)
-	for attempt in 6:
-		var clash := false
-		for b in taken:
-			if absf(angle_difference(b, _melee_base)) < deg_to_rad(50.0):
-				clash = true
-				# step round to whichever side we're already leaning toward
-				var lean := signf(angle_difference(b, _melee_base))
-				_melee_base += (lean if lean != 0.0 else 1.0) * deg_to_rad(55.0)
-				break
-		if not clash:
-			break
-	var contact := foe.center() + Vector2.RIGHT.rotated(_melee_base) * foe.radius()
-	var order := range(soldier_count)
-	order.sort_custom(func(a: int, b: int) -> bool:
-		return _men[a].distance_squared_to(contact) < _men[b].distance_squared_to(contact))
-	for k in order.size():
-		_ring[order[k]] = k
+	m.cool = SWING_TIME * randf_range(0.85, 1.15)
+	m.swing = SWING_ANIM
+	var foe := t.sq
+	# Which side of HIS BLOCK is the blow coming from?
+	var from := (m.pos - foe.center()).normalized()
+	var dot := from.dot(Vector2.RIGHT.rotated(foe.rotation))
+	var mult := 1.0
+	var chance := HIT_CHANCE
+	var flank := false
+	if dot < -0.35:
+		mult = REAR_MULT
+		chance += REAR_HIT_BONUS
+		flank = true
+	elif dot < 0.5:
+		mult = SIDE_MULT
+		chance += SIDE_HIT_BONUS
+		flank = true
+	if foe.routing:
+		chance = 0.9
+		mult = REAR_MULT
+	elif flank:
+		foe.flank_t = FLANK_SHOW
+		foe.flank_rear = mult == REAR_MULT
+		foe.flank_dir = foe.flank_dir.lerp(from, 0.3).normalized() if foe.flank_dir != Vector2.ZERO else from
+	if randf() > chance:
+		return # blocked
+	# Our side: valor, the Commander's guard, an overloaded squad's clumsiness.
+	# Their side: overloaded squads are sloppy and bleed more; the guard is tough.
+	var dmg := mult * _valor_damage_mult() * (0.5 + 0.5 * efficiency())
+	if is_commander:
+		dmg *= COMMANDER_GUARD_DAMAGE
+	dmg *= Terrain.damage_mult(m.pos, t.pos)
+	dmg *= (2.0 - foe.efficiency()) * (COMMANDER_GUARD_TOUGHNESS if foe.is_commander else 1.0)
+	t.hp -= dmg
+	t.flash = FLASH_TIME
+	foe._sparks.append({ "pos": t.pos.lerp(m.pos, 0.4), "left": 0.15, "flank": flank })
+	if t.hp <= 0.0:
+		foe._kill(t)
 
 
-## How many enemy squads are fighting us right now.
-func _attacker_count() -> int:
-	var n := 0
-	for node in get_tree().get_nodes_in_group("squads"):
-		var other := node as Squad
-		if other != null and other.team != team and not other.routing and other.engaged_with == self:
-			n += 1
-	return n
-
-
-func _next_ring_place() -> int:
-	var hi := -1
-	for k in _ring:
-		hi = maxi(hi, k)
-	return hi + 1
-
-
-## The man most exposed: lowest ring place in melee, else the front rank.
-func _front_man() -> int:
-	if _men.is_empty():
-		return -1
-	var best := 0
-	for i in _ring.size():
-		if _ring[i] >= 0 and (_ring[best] < 0 or _ring[i] < _ring[best]):
-			best = i
-	return best
-
-
-## How much we wrap around our target: 0 = even fight, 1 = clearly surrounding.
-func _envelopment(defender: Squad) -> float:
-	if defender.soldier_count <= 0:
-		return 0.0
-	return clampf((float(soldier_count) / defender.soldier_count - 1.0) / 1.0, 0.0, 1.0)
+## A man falls: dead or wounded, his record goes to the roll call.
+func _kill(t: Man) -> void:
+	var idx := _m.find(t)
+	if idx < 0:
+		return
+	t.alive = false
+	t.target = null
+	var who: Soldier = null
+	if idx < members.size():
+		who = members[idx]
+		members.remove_at(idx)
+	_m.remove_at(idx)
+	# Dead or wounded? A sloppy (overloaded) or fleeing squad leaves more dead
+	var chance := WOUNDED_CHANCE_FLEEING if routing else WOUNDED_CHANCE * (0.5 + 0.5 * efficiency())
+	if has_trait("Caring"):
+		chance = minf(0.85, chance + 0.2) # his men get carried off, not left
+	soldier_fell.emit(t.pos, color, who, randf() < chance)
+	soldier_count -= 1
+	# Each loss hurts relative to squad size (tuned for 10), and more when overloaded
+	morale -= MORALE_PER_CASUALTY * 10.0 / maxf(_start_count, 1.0) * (2.0 - efficiency()) * _charisma_loss_mult() * _familiarity_loss_mult()
+	if soldier_count <= 0:
+		died.emit(self)
+		queue_free()
+		return
+	_check_rout()
 
 
 # --- Orders ----------------------------------------------------------------
@@ -355,6 +424,7 @@ func move_to(pos: Vector2, facing: float = NAN) -> void:
 	if routing:
 		return
 	attack_target = null
+	attack_dir = Vector2.ZERO
 	if Terrain.in_water(pos):
 		pos = Terrain.bank_point(pos, Terrain.bank_side(global_position)) # stop at the near bank
 	target_position = pos
@@ -382,11 +452,13 @@ func enemy_withdrew() -> void:
 	_reform = REFORM_TIME
 
 
-## Chase an enemy squad and fight it. A planned attack hits harder on
+## Close with an enemy squad and fight it. A planned attack hits harder on
 ## first contact ("they were waiting for us!").
 func attack(enemy: Squad, planned: bool = false) -> void:
 	if routing:
 		return
+	if enemy != attack_target:
+		attack_dir = Vector2.ZERO
 	attack_target = enemy
 	has_target_facing = false
 	_planned_charge = planned
@@ -403,37 +475,108 @@ func place_at(pos: Vector2, facing: float) -> void:
 	queue_redraw() # the world is frozen while planning, so redraw now
 
 
+# --- Block geometry -------------------------------------------------------------
+
+## Half width (across the front) and half depth of the block.
+func half_size() -> Vector2:
+	var rows := maxi(ceili(float(soldier_count) / COLUMNS), 1)
+	var width := mini(maxi(soldier_count, 1), COLUMNS)
+	return Vector2((width - 1) * SPACING * 0.5 + SOLDIER_RADIUS, (rows - 1) * SPACING * 0.5 + SOLDIER_RADIUS)
+
+
+## How far from the middle the block's edge is, in direction `dir`.
+func reach_toward(dir: Vector2) -> float:
+	var h := half_size()
+	var f := Vector2.RIGHT.rotated(rotation)
+	return absf(dir.dot(f)) * h.y + absf(dir.dot(f.orthogonal())) * h.x
+
+
+## Where our middle stands to fight `t` from side `dir`: our front rank on its edge.
+func contact_spot(t: Squad, dir: Vector2) -> Vector2:
+	return t.center() + dir * (t.reach_toward(dir) + half_size().y + REACH * 0.5)
+
+
+## The side of `t` to attack from: one of its four real sides (front, left,
+## right, rear), nearest to us first, skipping any another block already holds.
+## Square to the side, so our whole front rank gets to fight.
+func _pick_side(t: Squad) -> Vector2:
+	var base := (center() - t.center()).normalized()
+	if base == Vector2.ZERO:
+		base = Vector2.RIGHT.rotated(rotation + PI)
+	var f := Vector2.RIGHT.rotated(t.rotation)
+	var sides: Array[Vector2] = [f, -f, f.orthogonal(), -f.orthogonal()]
+	sides.sort_custom(func(a: Vector2, b: Vector2) -> bool: return a.dot(base) > b.dot(base))
+	var tries: Array[Vector2] = []
+	if attack_dir != Vector2.ZERO:
+		# keep the side we chose (it turns with the target) while it's free
+		var keep := sides[0]
+		for d in sides:
+			if d.dot(attack_dir) > keep.dot(attack_dir):
+				keep = d
+		tries.append(keep)
+	tries.append_array(sides)
+	var mine := half_size().length()
+	for dir in tries:
+		var spot := contact_spot(t, dir)
+		var free := true
+		for node in get_tree().get_nodes_in_group("squads"):
+			var o := node as Squad
+			if o == null or o == self or o == t or o.routing or o.soldier_count <= 0:
+				continue
+			var there := o.center()
+			if o.attack_target == t and o.attack_dir != Vector2.ZERO:
+				there = o.contact_spot(t, o.attack_dir) # where it's going, not where it is
+			if there.distance_to(spot) < (mine + o.half_size().length()) * 0.8:
+				free = false
+				break
+		if free:
+			return dir
+	return sides[0]
+
+
 # --- Movement --------------------------------------------------------------
 
 func _move(delta: float) -> void:
 	var turn := minf(1.0, turn_speed * delta)
 	if _reform > 0.0:
 		_reform -= delta
-		if engaged_with == null:
+		if not in_contact:
 			return # re-forming after the enemy pulled away: not chasing yet
 
-	if engaged_with != null:
-		# In melee: slowly turn to face the enemy
-		var to_enemy := engaged_with.center() - center()
-		rotation = lerp_angle(rotation, to_enemy.angle(), minf(1.0, ENGAGED_TURN_SPEED * delta))
-		# Attacking squads hold their ground; others can only shuffle away slowly
-		if attack_target != null:
-			return
+	# Where the block's MIDDLE should go, and which way to face there
+	var dest := target_position + (center() - global_position)
+	var face_to := target_facing if has_target_facing else NAN
+	var hold := false
+	if attack_target != null:
+		# Close on a free side of the target, not its middle: a second squad
+		# wraps round to the flank instead of shoving the first from behind
+		_side_timer -= delta
+		if _side_timer <= 0.0 or attack_dir == Vector2.ZERO:
+			attack_dir = _pick_side(attack_target)
+			_side_timer = SIDE_REPICK
+		dest = contact_spot(attack_target, attack_dir)
+		face_to = (attack_target.center() - dest).angle()
+		# Stand once in place; caught on a corner short of our side, edge round
+		hold = in_contact and (center().distance_to(dest) < SLIDE_DONE or _fighting >= mini(soldier_count, COLUMNS) * 0.6)
+	elif in_contact and withdrawing <= 0.0:
+		hold = true # attacked while standing: fight where we face
+	if hold:
+		return # locked in melee: no moving, no wheeling round
 
-	# The stream is only crossed at the bridge
-	var to_target := Terrain.waypoint(global_position, target_position) - global_position
+	var from := center()
+	var to_target := Terrain.waypoint(from, dest) - from # the stream is crossed at the bridge or a ford
 	var dist := to_target.length()
-	var speed := move_speed * (0.6 + 0.4 * efficiency()) * Terrain.speed_mult(center())
+	var speed := move_speed * (0.6 + 0.4 * efficiency()) * Terrain.speed_mult(from)
 	if rallying:
 		speed *= RALLY_SPEED_MULT
-	if engaged_with != null:
-		speed *= ENGAGED_SPEED_MULT
+	if in_contact and withdrawing <= 0.0:
+		speed *= SLIDE_SPEED
 	if dist > 1.0:
-		if engaged_with == null:
+		if not in_contact or withdrawing > 0.0:
 			rotation = lerp_angle(rotation, to_target.angle(), turn)
 		_step(to_target / dist * minf(speed * delta, dist))
-	elif has_target_facing and engaged_with == null:
-		rotation = lerp_angle(rotation, target_facing, turn)
+	elif not is_nan(face_to) and not in_contact:
+		rotation = lerp_angle(rotation, face_to, turn)
 
 
 ## Routing squads run for their own map edge and leave the battle,
@@ -493,16 +636,25 @@ func _map_rect() -> Rect2:
 ## Commander only: take in rallied soldiers. They arrive shaken, so the
 ## Commander's squad loses a little morale (but never breaks from this).
 func absorb(count: int, positions := PackedVector2Array(), new_members: Array[Soldier] = []) -> void:
-	_sync_men(false)
-	soldier_count += count
 	members.append_array(new_members)
 	# The newcomers start where they actually are and walk into formation
-	for p in positions:
-		_men.append(p)
-		_ring.append(-1)
-	_sync_men(false)
+	for k in count:
+		var m := Man.new()
+		m.sq = self
+		m.hp = MAN_HP
+		m.cool = randf_range(0.0, SWING_TIME)
+		m.pos = positions[k] if k < positions.size() else global_position
+		_m.append(m)
+	soldier_count += count
 	morale = maxf(rout_threshold() + 10.0, morale - RALLY_MORALE_COST)
 	queue_redraw()
+
+
+func _men_positions() -> PackedVector2Array:
+	var out := PackedVector2Array()
+	for m in _m:
+		out.append(m.pos)
+	return out
 
 
 # --- Rallying --------------------------------------------------------------
@@ -537,9 +689,10 @@ func _rally_step() -> void:
 	target_position = cmd.global_position
 	var gap := center().distance_to(cmd.center()) - radius() - cmd.radius()
 	if gap < RALLY_JOIN_GAP:
-		_sync_men(false)
 		rallied.emit(self, cmd, soldier_count)
-		cmd.absorb(soldier_count, _men.duplicate(), members.duplicate())
+		cmd.absorb(soldier_count, _men_positions(), members.duplicate())
+		for m in _m:
+			m.alive = false
 		died.emit(self)
 		queue_free()
 
@@ -556,8 +709,11 @@ func _check_rout() -> void:
 	routing = true
 	rallying = false
 	engaged_with = null
+	in_contact = false
 	attack_target = null
 	selected = false
+	for m in _m:
+		m.target = null
 	routed.emit(self)
 	# Panic spreads to nearby allies (not when a squad that already broke once
 	# breaks again: nobody expected much of them by then)
@@ -668,123 +824,17 @@ func morale_shock(amount: float) -> void:
 	_check_rout()
 
 
-## Called by an attacker each frame: flanked squads lose morale fast.
-func apply_pressure(flank_mult: float, delta: float) -> void:
-	if routing:
-		return
-	morale -= (flank_mult - 1.0) * MORALE_FLANK_DRAIN * delta * (0.5 if is_commander else 1.0)
-
-
-# --- Combat ----------------------------------------------------------------
-
-func _find_engaged_enemy() -> Squad:
-	var my_center := center()
-	# Stay with the current opponent until we've clearly separated: avoids
-	# flickering in and out of melee right at the edge of contact.
-	if engaged_with != null and is_instance_valid(engaged_with) and engaged_with.soldier_count > 0:
-		var cur_gap := my_center.distance_to(engaged_with.center()) - radius() - engaged_with.radius()
-		if cur_gap < ENGAGE_GAP + ENGAGE_RELEASE:
-			return engaged_with
-	var best: Squad = null
-	var best_gap := ENGAGE_GAP
-	for node in get_tree().get_nodes_in_group("squads"):
-		var other := node as Squad
-		if other == null or other.team == team or other.soldier_count <= 0:
-			continue
-		if not _can_reach(other):
-			continue # across the water: they can glare, not fight
-		# Edge-to-edge distance between the two formations
-		var gap := my_center.distance_to(other.center()) - radius() - other.radius()
-		if gap < best_gap:
-			best_gap = gap
-			best = other
-	return best
-
-
-## Same bank, or one of us is on a crossing.
-func _can_reach(other: Squad) -> bool:
-	var a := center()
-	var b := other.center()
-	return Terrain.bank_side(a) == Terrain.bank_side(b) or Terrain.on_crossing(a) or Terrain.on_crossing(b)
-
-
 ## Middle of the formation (the node's origin is the middle of the front rank).
 func center() -> Vector2:
 	var rows := ceili(float(soldier_count) / COLUMNS)
 	return global_position - Vector2.RIGHT.rotated(rotation) * (maxi(rows, 1) - 1) * SPACING * 0.5
 
 
-## Rough size of the formation, used for melee contact and for keeping
-## squads from overlapping.
+## Size of the formation as a circle, used for keeping squads apart and for
+## labels. Half the diagonal: a block turned at an angle still fits inside, so
+## neighbours' corners don't overlap.
 func radius() -> float:
-	var rows := ceili(float(soldier_count) / COLUMNS)
-	var width := mini(soldier_count, COLUMNS)
-	var half_w := (width - 1) * SPACING * 0.5 + SOLDIER_RADIUS + 2.0
-	var half_d := (maxi(rows, 1) - 1) * SPACING * 0.5 + SOLDIER_RADIUS + 2.0
-	return maxf(half_w, half_d)
-
-
-func _fight(delta: float) -> void:
-	var mult := _flank_mult(engaged_with)
-	# Overloaded squads get fewer soldiers into the fight effectively
-	var dmg := soldier_count * DAMAGE_PER_SOLDIER * delta * mult * (0.5 + 0.5 * efficiency()) * _valor_damage_mult()
-	if is_commander:
-		dmg *= COMMANDER_GUARD_DAMAGE
-	# Ground: high ground, cover in the forest, footing in the stream
-	dmg *= Terrain.damage_mult(center(), engaged_with.center())
-	# Outnumbering the target lets our men wrap around it
-	var wrap := _envelopment(engaged_with)
-	dmg *= 1.0 + ENVELOP_DAMAGE * wrap
-	engaged_with.take_casualties(dmg)
-	engaged_with.apply_pressure(mult, delta)
-	if not engaged_with.routing:
-		engaged_with.morale -= ENVELOP_MORALE * wrap * delta
-
-
-## How exposed the defender is to us: front 1.0, side 1.5, rear 2.5.
-## A fleeing squad is always hit as if from behind.
-func _flank_mult(defender: Squad) -> float:
-	if defender.routing:
-		return REAR_MULT
-	var from_defender := center() - defender.center()
-	var off := absf(angle_difference(defender.rotation, from_defender.angle()))
-	if off < deg_to_rad(60):
-		return 1.0
-	elif off < deg_to_rad(120):
-		return SIDE_MULT
-	return REAR_MULT
-
-
-func take_casualties(amount: float) -> void:
-	if soldier_count <= 0:
-		return
-	# Overloaded squads are sloppy and take more losses: x1.0 up to x1.7
-	_incoming += amount * (2.0 - efficiency()) * (COMMANDER_GUARD_TOUGHNESS if is_commander else 1.0)
-	while _incoming >= 1.0 and soldier_count > 0:
-		_incoming -= 1.0
-		# The man at the point of contact falls; everyone else keeps his place
-		var idx := _front_man()
-		var who: Soldier = null
-		if idx >= 0 and idx < members.size():
-			who = members[idx]
-			members.remove_at(idx)
-		# Dead or wounded? A sloppy (overloaded) or fleeing squad leaves more dead
-		var chance := WOUNDED_CHANCE_FLEEING if routing else WOUNDED_CHANCE * (0.5 + 0.5 * efficiency())
-		if has_trait("Caring"):
-			chance = minf(0.85, chance + 0.2) # his men get carried off, not left
-		soldier_fell.emit(_men[idx] if idx >= 0 else to_global(_slot(soldier_count - 1)), color, who, randf() < chance)
-		if idx >= 0:
-			_men.remove_at(idx)
-			_ring.remove_at(idx)
-		soldier_count -= 1
-		# Each loss hurts relative to squad size (tuned for 10), and more when overloaded
-		morale -= MORALE_PER_CASUALTY * 10.0 / maxf(_start_count, 1.0) * (2.0 - efficiency()) * _charisma_loss_mult() * _familiarity_loss_mult()
-		_flash = FLASH_TIME
-	if soldier_count <= 0:
-		died.emit(self)
-		queue_free()
-		return
-	_check_rout()
+	return half_size().length() + 2.0
 
 
 # --- Drawing ---------------------------------------------------------------
@@ -804,12 +854,9 @@ func _draw() -> void:
 		return
 
 	var rows := maxi(ceili(float(soldier_count) / COLUMNS), 1)
-	var c := color
+	var base_c := color
 	if routing:
-		c = Color(color.darkened(0.35).lerp(Color(0.5, 0.5, 0.5), 0.4), 0.85)
-	elif _flash > 0.0:
-		c = color.lerp(Color.WHITE, 0.55)
-	var outline := Color(c.darkened(0.6), c.a)
+		base_c = Color(color.darkened(0.35).lerp(Color(0.5, 0.5, 0.5), 0.4), 0.85)
 
 	# Selection: a soft footprint with corner brackets, on the ground
 	if selected:
@@ -817,57 +864,66 @@ func _draw() -> void:
 		draw_rect(b, Color(1.0, 0.9, 0.35, 0.12), true)
 		_draw_brackets(b, Color(1.0, 0.9, 0.35, 0.95))
 
-	_sync_men(false)
-	var foe: Squad = null
-	if not routing and engaged_with != null and is_instance_valid(engaged_with):
-		foe = engaged_with
-
-	# Shadows on the ground (the camera turns these circles into ellipses)
-	for i in soldier_count:
-		draw_circle(to_local(_men[i]) + Vector2(1.5, 1.0).rotated(-rotation), SOLDIER_RADIUS + 0.8, Color(0, 0, 0, 0.32))
-
-	# Upright figures, far ones first so near ones overlap them
-	var order := range(soldier_count)
-	order.sort_custom(func(a: int, b: int) -> bool: return _men[a].y < _men[b].y)
-	var squad_face := Vector2.RIGHT.rotated(rotation)
-	for i in order:
-		var face_world := squad_face
-		if foe != null:
-			face_world = (foe.center() - _men[i]).normalized()
-		var face_screen := View.to_screen(face_world).normalized()
-		draw_set_transform_matrix(_upright_at(to_local(_men[i])))
-		_draw_man(c, outline, face_screen, not routing)
-	draw_set_transform(Vector2.ZERO, 0.0)
-
-	# Clash: sparks between our men and theirs while in melee
-	if foe != null:
-		var t := Time.get_ticks_msec() / 90
-		for k in mini(4, soldier_count):
-			var i := (t + k * 5) % soldier_count
-			var toward := (foe.center() - _men[i]).normalized()
-			var spark := View.to_screen(_men[i] - global_position) + View.to_screen(toward) * 6.0 + Vector2(0, -7)
-			draw_set_transform_matrix(_upright_at(Vector2.ZERO))
-			draw_line(spark, spark + Vector2(3, -3).rotated(float((t + k) % 6)), Color(1.0, 0.92, 0.6, 0.95), 1.4)
+	# Flank marker: a bright arc on the ground on the side being hit
+	if flank_t > 0.0 and not routing:
+		draw_set_transform(Vector2.ZERO, -rotation)
+		var mid_w := center() - global_position
+		var r := half_size().length() + 8.0
+		var a0 := flank_dir.angle()
+		var alpha := minf(1.0, flank_t)
+		draw_arc(mid_w, r, a0 - 0.6, a0 + 0.6, 14, Color(1.0, 0.45, 0.2, 0.9 * alpha), 4.0)
+		draw_arc(mid_w, r + 5.0, a0 - 0.35, a0 + 0.35, 10, Color(1.0, 0.45, 0.2, 0.5 * alpha), 2.0)
 		draw_set_transform(Vector2.ZERO, 0.0)
 
-	# Middle of where the men actually stand (they spread out in melee), world axes
+	# Shadows on the ground (the camera turns these circles into ellipses)
+	for m in _m:
+		draw_circle(to_local(m.pos) + Vector2(1.5, 1.0).rotated(-rotation), SOLDIER_RADIUS + 0.8, Color(0, 0, 0, 0.32))
+
+	# Upright figures, far ones first so near ones overlap them
+	var order := _m.duplicate()
+	order.sort_custom(func(a: Man, b: Man) -> bool: return a.pos.y < b.pos.y)
+	var squad_face := Vector2.RIGHT.rotated(rotation)
+	for m: Man in order:
+		var face_world := squad_face
+		if m.target != null:
+			face_world = (m.target.pos - m.pos).normalized()
+		elif routing:
+			face_world = squad_face
+		var face_screen := View.to_screen(face_world).normalized()
+		var c := base_c.lerp(Color.WHITE, 0.7) if m.flash > 0.0 else base_c
+		var outline := Color(c.darkened(0.6), c.a)
+		var thrust := sin(m.swing / SWING_ANIM * PI) * 5.0 if m.swing > 0.0 else 0.0
+		draw_set_transform_matrix(_upright_at(to_local(m.pos)))
+		_draw_man(c, outline, face_screen, not routing, thrust)
+	draw_set_transform(Vector2.ZERO, 0.0)
+
+	# Sparks where our men were struck (orange for blows in the flank)
+	for sp in _sparks:
+		var p: Vector2 = sp.pos
+		var a: float = sp.left / 0.15
+		var col := Color(1.0, 0.6, 0.25, a) if sp.flank else Color(1, 0.95, 0.6, a)
+		draw_set_transform_matrix(_upright_at(to_local(p)))
+		for k in 4:
+			var d := Vector2.from_angle(k * PI / 2.0 + 0.6)
+			draw_line(d * 1.5 + Vector2(0, -7), d * (5.5 if sp.flank else 4.5) + Vector2(0, -7), col, 1.3)
+	draw_set_transform(Vector2.ZERO, 0.0)
+
+	# Middle of where the men actually stand, world axes
 	var mid := center() - global_position
-	if soldier_count > 0:
+	if not _m.is_empty():
 		var sum := Vector2.ZERO
-		for m in _men:
-			sum += m
-		mid = sum / _men.size() - global_position
-	# Banner just behind where the men actually are (follows them into melee)
+		for m in _m:
+			sum += m.pos
+		mid = sum / _m.size() - global_position
+	# Banner just behind the block
 	var back := mid - Vector2.RIGHT.rotated(rotation) * ((rows - 1) * SPACING * 0.5 + 9.0)
-	if foe != null:
-		back = mid
 
 	# Commander's aura lies on the ground
 	if is_commander and not routing:
 		draw_set_transform(Vector2.ZERO, -rotation)
 		_draw_aura()
 
-	# Upright things above the squad: banner and morale bar (screen units)
+	# Upright things above the squad: banner, morale bar, flank tag (screen units)
 	draw_set_transform_matrix(_upright_at(Vector2.ZERO))
 	var sback := View.to_screen(back)
 	var smid := View.to_screen(mid)
@@ -893,6 +949,17 @@ func _draw() -> void:
 		bar_color = Color(0.95, 0.32, 0.28)
 	draw_rect(Rect2(bar_pos, Vector2(38 * frac, 5)), bar_color, true)
 	draw_rect(Rect2(bar_pos, Vector2(38 * frac, 2)), bar_color.lightened(0.3), true)
+	if flank_t > 0.0 and not routing:
+		# Ours flanked: a warning. Theirs: your plan working.
+		var tag := "REAR!" if flank_rear else "FLANKED"
+		var tc := Color(1.0, 0.5, 0.3) if team == 0 else Color(0.6, 1.0, 0.5)
+		var font := ThemeDB.fallback_font
+		# Same size on screen at any camera zoom
+		var z := maxf(get_canvas_transform().x.length(), 0.01)
+		var at := bar_pos + Vector2(19, -4)
+		draw_set_transform_matrix(_upright_at(Vector2.ZERO) * Transform2D(0.0, Vector2.ONE / z, 0.0, at))
+		draw_string_outline(font, Vector2(-60, 0), tag, HORIZONTAL_ALIGNMENT_CENTER, 120, 12, 3, Color(0, 0, 0, 0.6 * minf(1.0, flank_t)))
+		draw_string(font, Vector2(-60, 0), tag, HORIZONTAL_ALIGNMENT_CENTER, 120, 12, Color(tc, minf(1.0, flank_t)))
 	draw_set_transform(Vector2.ZERO, 0.0)
 
 
@@ -906,15 +973,16 @@ func _upright_at(p: Vector2) -> Transform2D:
 
 
 ## One soldier standing at (0, 0), drawn upright in screen units.
-## face = the direction he faces on screen. Shield and spear go in front of
-## the body, or behind it when he faces away from the camera.
-func _draw_man(c: Color, outline: Color, face: Vector2, armed: bool) -> void:
+## face = the direction he faces on screen; thrust = how far his spear is
+## pushed out (a swing). Shield and spear go in front of the body, or behind
+## it when he faces away from the camera.
+func _draw_man(c: Color, outline: Color, face: Vector2, armed: bool, thrust := 0.0) -> void:
 	var away := face.y < -0.25
 	var wood := Color(0.55, 0.42, 0.26, c.a)
 	var metal := Color(0.85, 0.85, 0.8, c.a)
 	var shield_at := Vector2(0, -6.0) + face * 3.4
-	var spear_a := Vector2(0, -5.0) - face * 3.0
-	var spear_b := Vector2(0, -12.0) + face * 9.0
+	var spear_a := Vector2(0, -5.0) - face * 3.0 + face * thrust
+	var spear_b := Vector2(0, -12.0) + face * (9.0 + thrust)
 
 	if armed and away:
 		draw_line(spear_a, spear_b, wood, 1.1)
@@ -985,8 +1053,8 @@ func man_at(point: Vector2) -> int:
 	var best := -1
 	var best_d := SOLDIER_RADIUS + 3.0
 	var body_up := Vector2(0, -7.0 / View.TILT)
-	for i in _men.size():
-		var d := minf(_men[i].distance_to(point), (_men[i] + body_up).distance_to(point))
+	for i in _m.size():
+		var d := minf(_m[i].pos.distance_to(point), (_m[i].pos + body_up).distance_to(point))
 		if d < best_d:
 			best_d = d
 			best = i
@@ -994,7 +1062,7 @@ func man_at(point: Vector2) -> int:
 
 
 func man_position(i: int) -> Vector2:
-	return _men[i]
+	return _m[i].pos
 
 
 ## In a forest with no enemy close enough to see in: the enemy doesn't know
@@ -1027,8 +1095,8 @@ func touches_rect(rect: Rect2) -> bool:
 	if rect.has_point(center()) or rect.has_point(global_position):
 		return true
 	var body_up := Vector2(0, -9.0 / View.TILT)
-	for m in _men:
-		if rect.has_point(m) or rect.has_point(m + body_up):
+	for m in _m:
+		if rect.has_point(m.pos) or rect.has_point(m.pos + body_up):
 			return true
 	return false
 
@@ -1040,7 +1108,7 @@ func contains_point(global_point: Vector2) -> bool:
 	for q in [global_point, global_point + Vector2(0, 12.0 / View.TILT)]:
 		if _local_bounds(rows).has_point(to_local(q)):
 			return true
-		for m in _men: # soldiers spread out in melee can be clicked too
-			if m.distance_to(q) < SOLDIER_RADIUS + 5.0:
+		for m in _m: # soldiers stepping out to fight can be clicked too
+			if m.pos.distance_to(q) < SOLDIER_RADIUS + 5.0:
 				return true
 	return false

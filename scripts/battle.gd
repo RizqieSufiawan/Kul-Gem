@@ -69,7 +69,7 @@ const CAM_EDGE_MARGIN := Vector2(40, 40) # screen px you can pan past the map ed
 const CAM_EDGE_MARGIN_TOP_LEFT := Vector2(40, 80) # more at the top: the top bar covers it
 const ROTATE_STEP := deg_to_rad(15.0) # Q / E during planning
 const ALLY_GAP := 6.0 # allies keep at least this much space between formations
-const ENEMY_OVERLAP := 2.0 # enemies may press this far into each other, no further
+const FOE_GAP := 1.0 # enemy blocks keep at least this far apart (edge to edge)
 
 var phase := Phase.PLANNING
 var squads: Array[Squad] = []
@@ -113,6 +113,10 @@ var end_screen: Control
 var field: Battlefield
 var overlay: Node2D # labels and previews, drawn above every squad
 var cam: Camera2D
+## 3D view (default) or the original 2.5D canvas. F3 switches.
+var render_3d := true
+var view3d # BattleView3D when render_3d
+var _drag_screen_start := Vector2.ZERO
 var _cam_zoom := 1.0 # 1 = whole map; the vertical squash (View.TILT) comes on top
 var _panning := false
 var _start_soldiers := 0
@@ -134,6 +138,7 @@ var _rdrag_end := Vector2.ZERO
 func _ready() -> void:
 	# Battle keeps handling input while the game is paused
 	process_mode = Node.PROCESS_MODE_ALWAYS
+	render_3d = Campaign.render_3d
 
 	# 2.5D: draw nearer things (lower on the map) over farther ones
 	y_sort_enabled = true
@@ -208,6 +213,8 @@ func _ready() -> void:
 
 	_build_ui()
 	_build_cards()
+	if render_3d:
+		_setup_3d()
 
 	# Planning happens with the world frozen
 	get_tree().paused = true
@@ -263,6 +270,9 @@ func _on_card_focus(card: SquadCard) -> void:
 	if card.squad == null or not is_instance_valid(card.squad):
 		return
 	_on_card_picked(card, false)
+	if view3d != null:
+		view3d.focus(card.squad.center())
+		return
 	cam.position = card.squad.center()
 	_cam_zoom = maxf(_cam_zoom, 1.8)
 	_apply_camera()
@@ -573,6 +583,8 @@ func _spawn_squad(pos: Vector2, team: int, color: Color, facing: float,
 	s.position = pos
 	s.rotation = facing
 	add_child(s)
+	if view3d != null:
+		s.visible = false
 	squads.append(s)
 	s.died.connect(_on_squad_died)
 	s.routed.connect(_on_squad_routed)
@@ -592,6 +604,8 @@ func _on_squad_died(s: Squad) -> void:
 
 func _on_soldier_fell(pos: Vector2, color: Color, who: Soldier, wounded: bool) -> void:
 	field.add_fallen(pos, color)
+	if view3d != null:
+		view3d.add_corpse(pos, color, Vector2.RIGHT.rotated(randf() * TAU))
 	Sound.play("hit", 0.0, 0.12, 90)
 	if who == null:
 		return
@@ -621,8 +635,12 @@ func _on_squad_routed(s: Squad) -> void:
 
 
 func _process(delta: float) -> void:
-	_pan_with_keys(delta)
+	if view3d == null:
+		_pan_with_keys(delta)
 	if phase == Phase.BATTLE and not get_tree().paused:
+		# Where every soldier stands, for the squads to find foes in reach
+		# (the battle runs before its squads each frame)
+		Squad.build_grid(squads)
 		_check_triggers()
 		_tick_messengers(delta)
 		_ai_timer -= delta
@@ -659,6 +677,32 @@ func _process(delta: float) -> void:
 		_hint.visible = phase == Phase.PLANNING or get_tree().paused or _hint_left > 0.0
 
 
+## The 3D view takes over drawing: the 2D field, squads and overlay are
+## hidden (they keep running the battle), and the labels go on a layer
+## under the UI.
+func _setup_3d() -> void:
+	field.visible = false
+	overlay.visible = false
+	for s in squads:
+		s.visible = false
+	view3d = preload("res://scripts/battle_view3d.gd").new(self)
+	add_child(view3d)
+	var ov := Control.new()
+	ov.set_anchors_preset(Control.PRESET_FULL_RECT)
+	ov.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	ov.draw.connect(func() -> void: view3d.draw_overlay(ov))
+	_ui.add_child(ov)
+	_ui.move_child(ov, 0)
+	view3d.overlay = ov
+
+
+## Where the mouse points on the map.
+func _mouse_world() -> Vector2:
+	if view3d != null:
+		return view3d.pick(get_viewport().get_mouse_position())
+	return get_global_mouse_position()
+
+
 ## Hovering one of our soldiers shows who he is.
 func _update_tooltip() -> void:
 	tooltip.visible = false
@@ -686,11 +730,11 @@ func _update_tooltip() -> void:
 			tooltip.position = Vector2(clampf(r.position.x, 4, 1280 - tooltip.size.x - 4), r.position.y - tooltip.size.y - 6)
 			tooltip.visible = true
 			return
-	var mouse := get_global_mouse_position()
+	var mouse := _mouse_world()
 	for s in squads:
 		if s.team != 0 or s.members.is_empty():
 			continue
-		var i := s.man_at(mouse)
+		var i: int = view3d.man_index_at_screen(s, get_viewport().get_mouse_position()) if view3d != null else s.man_at(mouse)
 		if i < 0 or i >= s.members.size():
 			continue
 		var who: Soldier = s.members[i]
@@ -1289,7 +1333,9 @@ func _terrain_help() -> Array:
 func _view_help() -> Array:
 	return ["View", [
 		["1-9", "select a squad (twice: go to it)"],
-		["Wheel, arrows", "zoom and pan; Home resets"]]]
+		["Wheel, arrows", "zoom and pan; Home resets"],
+		["Middle-drag", "turn and tilt the camera (3D)"],
+		["F3", "switch 3D / 2D view"]]]
 
 
 ## One column of sections: a title, then key / what-it-does rows.
@@ -1326,7 +1372,9 @@ func _help_column(sections: Array) -> VBoxContainer:
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton:
-		var mouse := get_global_mouse_position()
+		var mouse := _mouse_world()
+		if view3d != null and event.button_index in [MOUSE_BUTTON_WHEEL_UP, MOUSE_BUTTON_WHEEL_DOWN, MOUSE_BUTTON_MIDDLE]:
+			return # the 3D camera handles these
 		if event.button_index == MOUSE_BUTTON_WHEEL_UP and event.pressed:
 			_zoom_at_mouse(1.15)
 			return
@@ -1341,6 +1389,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				_dragging = true
 				_drag_start = mouse
 				_drag_end = mouse
+				_drag_screen_start = get_viewport().get_mouse_position()
 			elif _dragging:
 				_dragging = false
 				_on_left_release(mouse, event.shift_pressed)
@@ -1354,13 +1403,13 @@ func _unhandled_input(event: InputEvent) -> void:
 				_on_right_release(mouse)
 
 	elif event is InputEventMouseMotion:
-		if _panning:
+		if _panning and view3d == null:
 			cam.position -= event.relative / cam.zoom
 			_apply_camera()
 		if _dragging:
-			_drag_end = get_global_mouse_position()
+			_drag_end = _mouse_world()
 		if _rdragging:
-			_rdrag_end = get_global_mouse_position()
+			_rdrag_end = _mouse_world()
 
 	elif event is InputEventKey and event.pressed and not event.echo:
 		_on_key(event.keycode)
@@ -1375,7 +1424,16 @@ func _on_left_release(mouse: Vector2, additive: bool) -> void:
 		_zone_mode = false
 		_update_help()
 	elif is_drag:
-		_box_select(rect, additive)
+		if view3d != null:
+			# In 3D the box is drawn on the screen
+			var screen_rect := Rect2(_drag_screen_start, get_viewport().get_mouse_position() - _drag_screen_start).abs()
+			if not additive:
+				_clear_selection()
+			for s in squads:
+				if s.team == 0 and view3d.squad_in_screen_rect(s, screen_rect):
+					_select(s)
+		else:
+			_box_select(rect, additive)
 	else:
 		_click_select(mouse, additive)
 
@@ -1410,6 +1468,11 @@ func _on_key(key: Key) -> void:
 			_hotkey(key - KEY_1)
 		KEY_HOME:
 			_reset_camera()
+		KEY_F3:
+			# Switch 2D / 3D (restarts this battle's planning)
+			Campaign.render_3d = not Campaign.render_3d
+			get_tree().paused = false
+			get_tree().reload_current_scene()
 		KEY_TAB:
 			help_panel.visible = not help_panel.visible
 		KEY_SPACE:
@@ -1456,7 +1519,7 @@ func _toggle_hold() -> void:
 func _scout_under_mouse() -> void:
 	if phase != Phase.PLANNING or scout_points <= 0:
 		return
-	var e := _squad_at(get_global_mouse_position(), 1)
+	var e := _squad_at(_mouse_world(), 1)
 	if e == null or e.get_meta("scouted", false):
 		return
 	e.set_meta("scouted", true)
@@ -1476,6 +1539,8 @@ func _rotate_selected(angle: float) -> void:
 
 
 func _squad_at(point: Vector2, team: int) -> Squad:
+	if view3d != null:
+		return view3d.squad_at_screen(get_viewport().get_mouse_position(), team) # bodies stand up: pick on screen
 	for s in squads:
 		if s.team == team and s.contains_point(point):
 			return s
@@ -1495,7 +1560,7 @@ func _zone_at(point: Vector2) -> int:
 func _assign_order(action: Action) -> void:
 	if phase != Phase.PLANNING or selected.is_empty():
 		return
-	var zi := _zone_at(get_global_mouse_position())
+	var zi := _zone_at(_mouse_world())
 	if zi < 0:
 		return
 	for s in selected:
@@ -1513,7 +1578,7 @@ func _remove_orders_for(s: Squad) -> void:
 func _delete_zone_under_mouse() -> void:
 	if phase != Phase.PLANNING:
 		return
-	var zi := _zone_at(get_global_mouse_position())
+	var zi := _zone_at(_mouse_world())
 	if zi < 0:
 		return
 	var zone := zones[zi]
@@ -1655,8 +1720,10 @@ func _separate_squads() -> void:
 			var b := squads[j]
 			if b.routing:
 				continue
-			var min_dist := a.radius() + b.radius()
-			min_dist += ALLY_GAP if a.team == b.team else -ENEMY_OVERLAP
+			if b.team != a.team:
+				_separate_foes(a, b)
+				continue
+			var min_dist := a.radius() + b.radius() + ALLY_GAP
 			var delta := b.center() - a.center()
 			var d := delta.length()
 			if d >= min_dist:
@@ -1665,6 +1732,29 @@ func _separate_squads() -> void:
 			var overlap := min_dist - d
 			_nudge(a, -push * overlap * 0.5)
 			_nudge(b, push * overlap * 0.5)
+
+
+## Enemy blocks are solid: two of them can't overlap (tested as turned
+## rectangles), but may stand close enough for their front ranks to fight.
+func _separate_foes(a: Squad, b: Squad) -> void:
+	var ha := a.half_size()
+	var hb := b.half_size()
+	var fa := Vector2.RIGHT.rotated(a.rotation)
+	var fb := Vector2.RIGHT.rotated(b.rotation)
+	var d := b.center() - a.center()
+	var best := INF
+	var best_axis := Vector2.ZERO
+	for axis in [fa, fa.orthogonal(), fb, fb.orthogonal()]:
+		var pa := absf(axis.dot(fa)) * ha.y + absf(axis.dot(fa.orthogonal())) * ha.x
+		var pb := absf(axis.dot(fb)) * hb.y + absf(axis.dot(fb.orthogonal())) * hb.x
+		var overlap: float = pa + pb + FOE_GAP - absf(d.dot(axis))
+		if overlap <= 0.0:
+			return # a gap along this axis: not overlapping
+		if overlap < best:
+			best = overlap
+			best_axis = axis if d.dot(axis) >= 0.0 else -axis
+	_nudge(a, -best_axis * best * 0.5)
+	_nudge(b, best_axis * best * 0.5)
 
 
 ## Move a squad aside. If it was standing at its destination, the destination
@@ -1860,6 +1950,8 @@ func _dashed_rect(ci: CanvasItem, r: Rect2, c: Color, width := 1.5) -> void:
 
 # Ground level: under the squads
 func _draw() -> void:
+	if view3d != null:
+		return # the 3D view draws the ground
 	# Deployment area (planning only)
 	if phase == Phase.PLANNING:
 		draw_rect(DEPLOY_ZONE, Color(PLAYER_COLOR, 0.08), true)
@@ -1919,6 +2011,49 @@ func _draw_objective(o: Dictionary) -> void:
 		Color(0.7, 0.6, 0.5, 0.9) if lost else Color(OBJ_COLOR, 0.95), HORIZONTAL_ALIGNMENT_CENTER, 200)
 
 
+## The label under a squad: [text, colour], or [] for none. Enemy role
+## (intel); our Commander; our squads only when there's something to say.
+func squad_label(s: Squad, hovered: Squad) -> Array:
+	if s.routing:
+		return []
+	if s.team == 1:
+		# Scouted roles always; "unknown" only while planning (in battle it's just clutter)
+		var scouted: bool = s.get_meta("scouted", false)
+		if scouted or phase == Phase.PLANNING:
+			return [String(s.get_meta("role", "line")).to_upper() if scouted else "UNKNOWN", Color(1.0, 0.72, 0.68, 0.95)]
+		return []
+	if s.is_commander:
+		if phase == Phase.PLANNING or s.selected or s == hovered:
+			return ["COMMANDER", Color(COMMANDER_COLOR, 0.95)]
+		return []
+	if s.rallying:
+		return ["RALLYING", Color(COMMANDER_COLOR, 0.95)]
+	var tags := []
+	var c := Color(0.85, 0.9, 1.0, 0.95)
+	if s.is_overloaded():
+		tags.append("OVERLOADED %d%%" % roundi(s.efficiency() * 100))
+		c = Color(1.0, 0.65, 0.35)
+	if s.withdrawing > 0.0:
+		tags.append("WITHDRAWING")
+		c = Color(1.0, 0.85, 0.5)
+	if s.get_meta("hold", false):
+		tags.append("HOLD")
+	elif s.has_meta("init_target"):
+		tags.append("FLANKING")
+		c = Color(0.6, 1.0, 0.55)
+	for order in orders:
+		if not order.fired and order.squad == s:
+			tags.append("AMBUSH" if order.action == Action.ATTACK else "WILL RETREAT")
+	var show_count := s.selected or s == hovered
+	if tags.is_empty() and not show_count:
+		return []
+	var who_leads := s.leader.name + "  " if s.leader != null else ""
+	var text := "%s%d / %d" % [who_leads, s.soldier_count, s.command]
+	if not tags.is_empty():
+		text = text + "  " + "  ".join(tags) if show_count else "  ".join(tags)
+	return [text, c]
+
+
 # Overlay: above the squads (labels, previews, messengers)
 func _draw_overlay() -> void:
 	var o2 := overlay
@@ -1950,49 +2085,14 @@ func _draw_overlay() -> void:
 			HORIZONTAL_ALIGNMENT_RIGHT, 110)
 
 	# Labels under squads: enemy role (intel); ours only when it matters
-	var hovered := _squad_at(get_global_mouse_position(), 0)
+	var hovered := _squad_at(_mouse_world(), 0)
 	for s in squads:
 		if s.routing:
 			continue
-		var under := s.center() + Vector2(0, s.radius() + 28.0)
-		if s.team == 1:
-			# Scouted roles always; "unknown" only while planning (in battle it's just clutter)
-			var scouted: bool = s.get_meta("scouted", false)
-			if scouted or phase == Phase.PLANNING:
-				var role := String(s.get_meta("role", "line")).to_upper() if scouted else "UNKNOWN"
-				_text(o2, under + Vector2(-80, 0), role, 11, Color(1.0, 0.72, 0.68, 0.95))
-			continue
-		if s.is_commander:
-			if phase == Phase.PLANNING or s.selected or s == hovered:
-				_text(o2, under + Vector2(-80, 0), "COMMANDER", 11, Color(COMMANDER_COLOR, 0.95))
-			continue
-		var tags := []
-		var c := Color(0.85, 0.9, 1.0, 0.95)
-		if s.rallying:
-			_text(o2, under + Vector2(-110, 0), "RALLYING", 11, Color(COMMANDER_COLOR, 0.95), HORIZONTAL_ALIGNMENT_CENTER, 220)
-			continue
-		if s.is_overloaded():
-			tags.append("OVERLOADED %d%%" % roundi(s.efficiency() * 100))
-			c = Color(1.0, 0.65, 0.35)
-		if s.withdrawing > 0.0:
-			tags.append("WITHDRAWING")
-			c = Color(1.0, 0.85, 0.5)
-		if s.get_meta("hold", false):
-			tags.append("HOLD")
-		elif s.has_meta("init_target"):
-			tags.append("FLANKING")
-			c = Color(0.6, 1.0, 0.55)
-		for order in orders:
-			if not order.fired and order.squad == s:
-				tags.append("AMBUSH" if order.action == Action.ATTACK else "WILL RETREAT")
-		var show_count := s.selected or s == hovered
-		if tags.is_empty() and not show_count:
-			continue
-		var who_leads := s.leader.name + "  " if s.leader != null else ""
-		var text := "%s%d / %d" % [who_leads, s.soldier_count, s.command]
-		if not tags.is_empty():
-			text = text + "  " + "  ".join(tags) if show_count else "  ".join(tags)
-		_text(o2, under + Vector2(-110, 0), text, 11, c, HORIZONTAL_ALIGNMENT_CENTER, 220)
+		var lab := squad_label(s, hovered)
+		if not lab.is_empty():
+			var under := s.center() + Vector2(0, s.radius() + 28.0)
+			_text(o2, under + Vector2(-110, 0), lab[0], 11, lab[1], HORIZONTAL_ALIGNMENT_CENTER, 220)
 
 	# Floating messages (scouting, rallying)
 	for p in _popups:

@@ -31,6 +31,8 @@ var groups: Array[Dictionary] = []
 var battle_number := 1
 var gold := START_GOLD
 var recruit_pool := START_RECRUIT_POOL
+## Draw battles in 3D (F3 in battle switches). Kept for the whole session.
+var render_3d := true
 ## Spare soldiers in camp, in no group: they cost upkeep and fill gaps for free
 var reserves: Array[Soldier] = []
 ## Result of the last battle, for the roll call: see apply_result()
