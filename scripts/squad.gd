@@ -33,12 +33,14 @@ const SPACING := 12.0
 const COLUMNS := 5 # soldiers per rank (formation width)
 
 # --- Soldiers -----------------------------------------------------------------
-const MAN_HP := 10.0
+const MAN_HP := 12.0
 const MAN_SPEED := 75.0 # how fast a soldier walks to his place (px/s), on top of the squad's pace
 const REACH := 12.0 # melee range, centre to centre
 const LUNGE := 7.0 # how far a man steps out of his place to fight
+const SUPPORT_REACH := 28.0 # the rank behind thrusts over the front rank's shoulders...
+const SUPPORT_MULT := 0.5 # ...for less (no weight behind it)
 const SWING_TIME := 1.0 # seconds between a man's swings (each jittered)
-const HIT_CHANCE := 0.5
+const HIT_CHANCE := 0.42
 const SIDE_MULT := 1.5 # damage from the side of the block...
 const REAR_MULT := 2.5 # ...and from behind
 const SIDE_HIT_BONUS := 0.12 # easier to land on men not facing you
@@ -47,7 +49,7 @@ const RETARGET_TIME := 0.3
 const FOE_GAP := 8.0 # men of opposing sides never stand closer than this
 const MAX_SHOVE := 30.0 # px/s: how fast blocks pressing on each other give way
 const FLASH_TIME := 0.12
-const SWING_ANIM := 0.22
+const SWING_ANIM := 0.3
 
 # --- Squads in melee ------------------------------------------------------------
 const SLIDE_SPEED := 0.3 # speed fraction while edging round to our side, fighting
@@ -100,6 +102,8 @@ class Man:
 	var swing := 0.0 # > 0 while the thrust animation plays
 	var flash := 0.0
 	var target: Man = null
+	var support := false # striking over the man in front (second rank), not stepping out
+	var block := 0.0 # > 0 while he catches a blow on his shield
 	var retarget := 0.0
 	var alive := true
 	var sq: Squad
@@ -273,12 +277,15 @@ func _update_men(delta: float) -> void:
 		m.home = to_global(_slot(i))
 		m.swing = maxf(0.0, m.swing - delta)
 		m.flash = maxf(0.0, m.flash - delta)
+		m.block = maxf(0.0, m.block - delta)
 		if routing or withdrawing > 0.0:
 			m.target = null # backs turned: no fighting back
 		else:
 			_choose_target(m, delta)
 		var want := m.home
-		if m.target != null:
+		if m.target != null and m.support:
+			_swing(m, delta) # from his place, over the front rank
+		elif m.target != null:
 			fighting += 1
 			foes[m.target.sq] = int(foes.get(m.target.sq, 0)) + 1
 			var to := m.target.pos - m.home
@@ -287,7 +294,7 @@ func _update_men(delta: float) -> void:
 			want = m.home + to / maxf(d, 0.01) * clampf(d - REACH + 2.0, 0.0, LUNGE)
 			_swing(m, delta)
 		m.pos = m.pos.move_toward(want, pace * delta)
-		if m.target != null:
+		if m.target != null and not m.support:
 			# The lines meet, they don't mesh: never stand inside a foe, and
 			# where two blocks overlap, our block gives way a little
 			for e in men_near(m.pos, SPACING, 1 - team):
@@ -321,10 +328,31 @@ func _choose_target(m: Man, delta: float) -> void:
 	var reach := REACH + LUNGE
 	var t := m.target
 	var ok := t != null and t.alive and is_instance_valid(t.sq) and not t.sq.routing \
-		and m.home.distance_to(t.pos) <= reach + 2.0
+		and m.home.distance_to(t.pos) <= (SUPPORT_REACH if m.support else reach) + 2.0
 	if ok and m.retarget > 0.0:
 		return
 	m.retarget = RETARGET_TIME * randf_range(0.8, 1.2)
+	m.support = false
+	m.target = _nearest_foe(m, reach)
+	if m.target == null and not routing:
+		# Nobody in reach: thrust over our own front rank, if one stands
+		# between us and them
+		var e := _nearest_foe(m, SUPPORT_REACH)
+		if e != null and not e.sq.routing and _covered(m, e):
+			m.target = e
+			m.support = true
+
+
+## A friend of ours stands between `m` and the foe `e`.
+func _covered(m: Man, e: Man) -> bool:
+	var mid := m.home.lerp(e.pos, 0.45)
+	for f in men_near(mid, SPACING * 0.75, team):
+		if f != m:
+			return true
+	return false
+
+
+func _nearest_foe(m: Man, reach: float) -> Man:
 	var best: Man = null
 	var best_score := INF
 	for e in men_near(m.home, reach, 1 - team):
@@ -336,7 +364,7 @@ func _choose_target(m: Man, delta: float) -> void:
 		if score < best_score:
 			best_score = score
 			best = e
-	m.target = best
+	return best
 
 
 ## Same bank, or one of them is on a crossing.
@@ -347,7 +375,7 @@ static func _reachable(a: Vector2, b: Vector2) -> bool:
 func _swing(m: Man, delta: float) -> void:
 	m.cool -= delta
 	var t := m.target
-	if m.cool > 0.0 or m.pos.distance_to(t.pos) > REACH + 1.5:
+	if m.cool > 0.0 or m.pos.distance_to(t.pos) > (SUPPORT_REACH if m.support else REACH) + 1.5:
 		return
 	m.cool = SWING_TIME * randf_range(0.85, 1.15)
 	m.swing = SWING_ANIM
@@ -374,10 +402,14 @@ func _swing(m: Man, delta: float) -> void:
 		foe.flank_rear = mult == REAR_MULT
 		foe.flank_dir = foe.flank_dir.lerp(from, 0.3).normalized() if foe.flank_dir != Vector2.ZERO else from
 	if randf() > chance:
-		return # blocked
+		t.block = 0.25 # caught on the shield
+		foe._sparks.append({ "pos": t.pos.lerp(m.pos, 0.35), "left": 0.12, "flank": false, "block": true })
+		return
 	# Our side: valor, the Commander's guard, an overloaded squad's clumsiness.
 	# Their side: overloaded squads are sloppy and bleed more; the guard is tough.
 	var dmg := mult * _valor_damage_mult() * (0.5 + 0.5 * efficiency())
+	if m.support:
+		dmg *= SUPPORT_MULT
 	if is_commander:
 		dmg *= COMMANDER_GUARD_DAMAGE
 	dmg *= Terrain.damage_mult(m.pos, t.pos)
@@ -902,6 +934,8 @@ func _draw() -> void:
 		var p: Vector2 = sp.pos
 		var a: float = sp.left / 0.15
 		var col := Color(1.0, 0.6, 0.25, a) if sp.flank else Color(1, 0.95, 0.6, a)
+		if sp.get("block", false):
+			col = Color(0.85, 0.92, 1.0, a * 0.8) # parried
 		draw_set_transform_matrix(_upright_at(to_local(p)))
 		for k in 4:
 			var d := Vector2.from_angle(k * PI / 2.0 + 0.6)

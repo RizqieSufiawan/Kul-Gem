@@ -102,6 +102,7 @@ var cards: Array[SquadCard] = [] # the squad bar at the bottom of the screen
 var _last_hotkey := -1
 var _last_hotkey_ms := 0
 var _ui: CanvasLayer
+var _minimap: Control # 3D only
 var pause_label: Label
 var end_label: Label
 var end_title: Label
@@ -130,7 +131,11 @@ var _zone_mode := false # next left-drag draws a zone instead of selecting
 var _dragging := false
 var _drag_start := Vector2.ZERO
 var _drag_end := Vector2.ZERO
-var _rdragging := false # right-drag sets the facing of a move/placement
+var _rdragging := false # Shift+right-drag sets the facing of a move/placement
+var _rpress := false # right button held (plain): a click orders, a drag pans the camera
+var _rpanning := false
+var _rpress_screen := Vector2.ZERO
+const PAN_THRESHOLD := 6.0 # screen px before a right-press counts as a drag
 var _rdrag_start := Vector2.ZERO
 var _rdrag_end := Vector2.ZERO
 
@@ -221,6 +226,13 @@ func _ready() -> void:
 	Sound.music("music_plan")
 	Sound.loop("amb_field", -16.0)
 	_update_help()
+	Guide.tip_at(Vector2(12, 46))
+	Guide.tip("welcome")
+	Guide.tip("planning")
+
+
+func _exit_tree() -> void:
+	Guide.clear_pending()
 
 
 # --- Squad bar -------------------------------------------------------------
@@ -272,6 +284,7 @@ func _on_card_focus(card: SquadCard) -> void:
 	_on_card_picked(card, false)
 	if view3d != null:
 		view3d.focus(card.squad.center())
+		view3d.follow_selected(true)
 		return
 	cam.position = card.squad.center()
 	_cam_zoom = maxf(_cam_zoom, 1.8)
@@ -299,6 +312,24 @@ func _update_cards() -> void:
 		var st := _squad_status(card.squad)
 		card.status = st[0]
 		card.status_color = st[1]
+
+
+## What each status word on a card means.
+const STATUS_INFO := {
+	"READY": "standing, waiting for orders",
+	"MARCHING": "walking to where you sent it",
+	"FIGHTING": "in melee. It can't turn to face a new attacker",
+	"FLANKING": "on its own, going round to hit an enemy's side (H stops it)",
+	"ATTACKING": "marching to attack the enemy you picked",
+	"ORDER EN ROUTE": "a messenger is still riding out with your order",
+	"AMBUSH": "waiting: attacks the first enemy who enters its zone",
+	"WILL RETREAT": "waiting: falls back when an enemy enters its zone",
+	"HOLD": "stays put, won't act on its own (H to release)",
+	"HIDDEN": "in a forest, unseen by the enemy",
+	"WITHDRAWING": "pulling out of a fight (costs morale)",
+	"BROKEN": "out of morale and running. Rallies if it reaches the Commander",
+	"RALLYING": "back under control, joining the Commander's squad",
+}
 
 
 ## A one-word state for the card: what is this squad doing right now?
@@ -362,13 +393,14 @@ func _zoom_at_mouse(factor: float) -> void:
 
 func _pan_with_keys(delta: float) -> void:
 	var dir := Vector2.ZERO
-	if Input.is_key_pressed(KEY_LEFT):
+	var letters := not _shifted()
+	if Input.is_key_pressed(KEY_LEFT) or (letters and Input.is_key_pressed(KEY_A)):
 		dir.x -= 1.0
-	if Input.is_key_pressed(KEY_RIGHT):
+	if Input.is_key_pressed(KEY_RIGHT) or (letters and Input.is_key_pressed(KEY_D)):
 		dir.x += 1.0
-	if Input.is_key_pressed(KEY_UP):
+	if Input.is_key_pressed(KEY_UP) or (letters and Input.is_key_pressed(KEY_W)):
 		dir.y -= 1.0
-	if Input.is_key_pressed(KEY_DOWN):
+	if Input.is_key_pressed(KEY_DOWN) or (letters and Input.is_key_pressed(KEY_S)):
 		dir.y += 1.0
 	if dir != Vector2.ZERO:
 		cam.position += dir * CAM_PAN_SPEED * delta / cam.zoom
@@ -424,7 +456,19 @@ func _build_ui() -> void:
 	_st.scouts = _bar_label(row, Color(0.8, 0.9, 1.0), 14)
 	_st.gold = _bar_label(row, COMMANDER_COLOR, 14)
 	_st.help = _bar_label(row, QUIET_GOLD, 13)
-	_st.help.text = "Tab  controls"
+	_st.help.text = "Tab  controls    F1  guide"
+	var bar_tips := {
+		"battle": "Which battle of the campaign this is.",
+		"ours": "Your soldiers still standing.",
+		"enemy": "Enemy soldiers still standing.",
+		"village": "Village places not burned yet.\nAn enemy alone in a place burns it in 30 s. If both burn, you lose.",
+		"scouts": "Scouts left. Shift+S over an enemy squad\nreveals its job and size (planning only).",
+		"gold": "Your gold, spent in camp after the battle.",
+		"help": "Tab: all keys.   F1: the guide (explains everything).",
+	}
+	for k in bar_tips:
+		_st[k].tooltip_text = bar_tips[k]
+		_st[k].mouse_filter = Control.MOUSE_FILTER_PASS
 
 	# The essentials, always on screen, just above the squad bar
 	_hint = Label.new()
@@ -559,6 +603,12 @@ func _update_status() -> void:
 	var names := { Phase.PLANNING: "PLANNING", Phase.BATTLE: "BATTLE", Phase.ENDED: "OVER" }
 	var chips := { Phase.PLANNING: PLAYER_COLOR.lightened(0.35), Phase.BATTLE: Color(0.95, 0.6, 0.35), Phase.ENDED: Color(0.6, 0.6, 0.55) }
 	_st.phase.text = names[phase]
+	_st.phase.mouse_filter = Control.MOUSE_FILTER_PASS
+	_st.phase.tooltip_text = {
+		Phase.PLANNING: "Planning: time is frozen. Place your squads in the blue area,\nscout, set ambushes, then press Enter.",
+		Phase.BATTLE: "Battle: time runs. Space pauses.",
+		Phase.ENDED: "The battle is over.",
+	}[phase]
 	_st.phase.add_theme_stylebox_override("normal", _chip_style(chips[phase]))
 	_st.ours.text = str(_count_soldiers(0))
 	_st.enemy.text = str(_count_soldiers(1))
@@ -566,8 +616,12 @@ func _update_status() -> void:
 	for o in objectives:
 		if not o.lost:
 			safe += 1
-	_st.village.text = "Village %d/%d" % [safe, objectives.size()]
-	_st.village.add_theme_color_override("font_color", COMMANDER_COLOR if safe == objectives.size() else Color(1.0, 0.5, 0.4))
+	var danger := false
+	for o in objectives:
+		if not o.lost and (o.get("threat", false) or o.progress > 0.0):
+			danger = true
+	_st.village.text = "Village %d/%d%s" % [safe, objectives.size(), "  !" if danger else ""]
+	_st.village.add_theme_color_override("font_color", COMMANDER_COLOR if safe == objectives.size() and not danger else Color(1.0, 0.5, 0.4))
 	_st.scouts.visible = phase == Phase.PLANNING
 	_st.scouts.text = "Scouts %d" % scout_points
 	_st.gold.text = "Gold %d" % Campaign.gold
@@ -632,11 +686,17 @@ func _on_squad_routed(s: Squad) -> void:
 	if phase == Phase.BATTLE:
 		# Theirs breaking sounds a bit lower than ours
 		Sound.play("rout", 0.0 if s.team == 0 else -2.0, 0.0)
+		if s.team == 0:
+			Guide.tip("broken")
 
 
 func _process(delta: float) -> void:
-	if view3d == null:
+	if view3d == null and not Guide.is_open:
 		_pan_with_keys(delta)
+	if view3d == null:
+		for sq in squads:
+			if is_instance_valid(sq) and sq.team == 0:
+				sq.modulate.a = 0.45 if sq.is_hidden() else 1.0 # hidden in a forest: see-through
 	if phase == Phase.BATTLE and not get_tree().paused:
 		# Where every soldier stands, for the squads to find foes in reach
 		# (the battle runs before its squads each frame)
@@ -655,12 +715,15 @@ func _process(delta: float) -> void:
 		_check_end()
 		if Engine.get_process_frames() % 10 == 0:
 			_update_status()
+			_watch_for_tips()
 	elif phase == Phase.BATTLE:
 		Sound.loop("battle_din", -80.0) # paused: hush the fighting
 		Sound.loop("fire", -80.0)
 	elif phase == Phase.PLANNING:
 		# Placed squads may not overlap or leave the deployment area
 		_separate_squads()
+		if Engine.get_process_frames() % 10 == 0:
+			_watch_for_tips()
 		for sq in squads:
 			if sq.team == 0:
 				sq.place_at(_clamp_to_deploy(sq.global_position), sq.rotation)
@@ -675,6 +738,25 @@ func _process(delta: float) -> void:
 	_update_cards()
 	if phase != Phase.ENDED:
 		_hint.visible = phase == Phase.PLANNING or get_tree().paused or _hint_left > 0.0
+
+
+## Tips for things that happen on their own (checked a few times a second).
+func _watch_for_tips() -> void:
+	for s in squads:
+		if not is_instance_valid(s) or s.routing:
+			continue
+		if s.flank_t > 0.0:
+			Guide.tip("flanked")
+		if s.team != 0:
+			continue
+		if s.engaged_with != null:
+			Guide.tip("contact")
+		if s.has_meta("init_target"):
+			Guide.tip("initiative")
+		if s.withdrawing > 0.0:
+			Guide.tip("withdraw")
+		if s.is_hidden():
+			Guide.tip("hidden")
 
 
 ## The 3D view takes over drawing: the 2D field, squads and overlay are
@@ -694,6 +776,19 @@ func _setup_3d() -> void:
 	_ui.add_child(ov)
 	_ui.move_child(ov, 0)
 	view3d.overlay = ov
+	# Minimap in the top-right corner, in a thin frame
+	var frame := PanelContainer.new()
+	var fs := _panel_style(0.85, 4)
+	fs.content_margin_left = 3
+	fs.content_margin_right = 3
+	fs.content_margin_top = 3
+	fs.content_margin_bottom = 3
+	frame.add_theme_stylebox_override("panel", fs)
+	_minimap = preload("res://scripts/minimap.gd").new(self, view3d)
+	frame.add_child(_minimap)
+	_ui.add_child(frame)
+	_ui.move_child(frame, 1) # under the help, the cards and the end screen
+	frame.position = Vector2(1280 - 210 - 6 - 10, 42)
 
 
 ## Where the mouse points on the map.
@@ -714,13 +809,24 @@ func _update_tooltip() -> void:
 		if card.get_global_rect().has_point(screen_mouse) and card.squad != null \
 				and is_instance_valid(card.squad) and card.squad.leader != null:
 			var l: Leader = card.squad.leader
+			var sq: Squad = card.squad
+			var st: String = _squad_status(sq)[0]
+			var bonus := floori(sq.command_effective() - sq.command)
+			var fam := sq.familiarity()
 			var lines: Array[String] = [
 				l.name + ("  (Commander)" if l.is_commander else ""),
-				"Command %d   Charisma %d   Tactics %d   Valor %d" % [l.command, l.charisma, l.tactics, l.valor],
+				"%s: %s" % [st, STATUS_INFO.get(st, "")],
+				"",
+				"%d soldiers / Command %d%s" % [sq.soldier_count, sq.command, ("  (+%d: the men know their leader well)" % bonus) if bonus > 0 else ""],
 			]
+			if sq.is_overloaded():
+				lines.append("OVERLOADED: works at %d%%. Too many men for this leader." % roundi(sq.efficiency() * 100))
+			lines.append("Morale %d / 100   (breaks under %d)" % [roundi(sq.morale), roundi(sq.rout_threshold())])
+			lines.append("Familiarity %d   %s" % [roundi(fam), ["new recruits", "drilled", "seasoned", "veterans"][mini(int(fam / 25.0), 3)]])
+			lines.append("")
+			lines.append("Command %d   Charisma %d   Tactics %d   Valor %d" % [l.command, l.charisma, l.tactics, l.valor])
 			for t in l.traits:
 				lines.append("%s: %s" % [t, Leader.TRAIT_INFO.get(t, "")])
-			lines.append("Soldiers' familiarity: %d" % roundi(card.squad.familiarity()))
 			var wounded := Campaign.wounded_count(l)
 			if wounded > 0:
 				lines.append("%d wounded, sitting this one out" % wounded)
@@ -748,6 +854,28 @@ func _update_tooltip() -> void:
 		tooltip.position = at
 		tooltip.visible = true
 		return
+	var foe: Squad = view3d.squad_at_screen(screen_mouse, 1) if view3d != null else _squad_at(mouse, 1)
+	if foe != null and not foe.routing:
+		var role := String(foe.get_meta("role", "line")) if foe.get_meta("scouted", false) else ""
+		var jobs := {
+			"line": "LINE: holds the front and marches at your army.",
+			"flank": "FLANK: swings wide to hit your side and rear.",
+			"reserve": "RESERVE: waits behind, joins where a friend is losing.",
+		}
+		var lines: Array[String] = ["Enemy squad  -  %s soldiers" % ("?" if foe.concealed else str(foe.soldier_count))]
+		if role != "":
+			lines.append(jobs.get(role, ""))
+		else:
+			lines.append("Job unknown." + ("  Shift+S to scout it (%d left)." % scout_points if phase == Phase.PLANNING and scout_points > 0 else ""))
+		if phase == Phase.BATTLE:
+			lines.append("Morale %d / 100" % roundi(foe.morale))
+		tooltip.text = "\n".join(lines)
+		tooltip.reset_size()
+		var at2 := screen_mouse + Vector2(16, -tooltip.size.y - 8)
+		at2.x = clampf(at2.x, 4, 1280 - tooltip.size.x - 4)
+		at2.y = clampf(at2.y, 40, 720 - tooltip.size.y - 4)
+		tooltip.position = at2
+		tooltip.visible = true
 
 
 # --- Win / lose ------------------------------------------------------------
@@ -949,6 +1077,7 @@ func _start_battle() -> void:
 			s.concealed = false
 	help_panel.visible = false # Tab brings it back
 	_hint_left = 8.0
+	Guide.tip("battle")
 	Sound.play("battle_start")
 	Sound.music("music_battle")
 	_update_help()
@@ -1085,10 +1214,22 @@ func _ai_raid() -> bool:
 			best.set_meta("raid", i)
 			best.remove_meta("init_target")
 			best.move_to(o.pos)
+			# Warn the player now, while there's still time to send someone
+			_popups.append({ "pos": o.pos, "text": "Raiders heading for %s!" % o.name, "left": POPUP_TIME * 2.0 })
+			Sound.play("bell", -4.0)
+			Guide.tip("raid")
 			raiders += 1
 			if raiders >= AI_MAX_RAIDERS:
 				break
 	return burning
+
+
+## The enemy squad sent to burn place `i`, if any.
+func _raider_squad(i: int) -> Squad:
+	for s in squads:
+		if is_instance_valid(s) and s.team == 1 and not s.routing and s.has_meta("raid") and int(s.get_meta("raid")) == i:
+			return s
+	return null
 
 
 func _raider_on(i: int) -> bool:
@@ -1134,7 +1275,12 @@ func _battle_sounds(delta: float) -> void:
 ## Burning: an enemy squad inside, none of ours near (hidden ones count:
 ## they're really there).
 func _tick_objectives(delta: float) -> void:
-	for o in objectives:
+	for i in objectives.size():
+		var o: Dictionary = objectives[i]
+		# Who is coming for it (drawn as a warning line and an edge arrow)
+		var raider := _raider_squad(i)
+		o["raider"] = raider
+		o["threat"] = raider != null and not o.lost
 		if o.lost:
 			continue
 		var raiders := 0
@@ -1153,9 +1299,11 @@ func _tick_objectives(delta: float) -> void:
 				o.lost = true
 				_popups.append({ "pos": o.pos, "text": "%s burned!" % o.name, "left": POPUP_TIME * 1.5 })
 				Sound.play("burned")
+				Guide.tip("burned")
 			elif o.progress - delta / OBJ_BURN_TIME <= 0.0:
 				_popups.append({ "pos": o.pos, "text": "%s is under attack!" % o.name, "left": POPUP_TIME })
 				Sound.play("bell")
+				Guide.tip("raid")
 			o.burning = true
 
 
@@ -1273,30 +1421,30 @@ func _update_help() -> void:
 		if _zone_mode:
 			_hint.text = "Drawing a zone: left-drag on the map     Z  cancel"
 		else:
-			_hint.text = "Right-click  place     Q / E  rotate     Z  draw zone     S  scout     Enter  START BATTLE     Tab  all controls"
+			_hint.text = "Right-click  place     Shift+Q / E  rotate     Z  draw zone     Shift+S  scout     Enter  START BATTLE     Tab  all controls"
 		left = [
 			["Deploy  (the world is frozen)", [
 				["Left-drag", "select squads"],
 				["Right-click", "place, inside the blue area"],
-				["Right-drag", "place and set facing"],
-				["Q / E", "rotate"],
+				["Shift+right-drag", "place and set facing"],
+				["Shift+Q / E", "rotate"],
 				["H", "hold: stay put, no initiative"]]],
 			["Battle plan", [
 				["Z, then drag", "draw a trigger zone"],
-				["A  over a zone", "selected squads ATTACK whoever enters"],
+				["Shift+A  over a zone", "selected squads ATTACK whoever enters"],
 				["R  over a zone", "selected squads RETREAT when an enemy enters"],
 				["X  over a zone", "delete it"]]],
 			["Intel", [
-				["S  over an enemy", "scout it: role and size (2 per battle)"]]],
+				["Shift+S  over an enemy", "scout it: role and size (2 per battle)"]]],
 		]
 		right = _terrain_help() + [_view_help()]
 	else:
-		_hint.text = "Space  pause     Right-click  order     Right-drag  move + facing     H  hold     Tab  all controls"
+		_hint.text = "Space  pause     Right-click  order     Shift+right-drag  move + facing     H  hold     Tab  all controls"
 		left = [
 			["Orders", [
 				["Space", "pause (orders still work)"],
 				["Right-click", "move, or attack an enemy"],
-				["Right-drag", "move and set facing"],
+				["Shift+right-drag", "move and set facing"],
 				["H", "hold: stay put, no initiative"]]],
 			["Messengers", [
 				["Far squads", "orders ride out from the Commander: they react later"],
@@ -1305,6 +1453,7 @@ func _update_help() -> void:
 		]
 		right = _terrain_help() + [_view_help()]
 	for c in _help_cols.get_children():
+		_help_cols.remove_child(c) # now, so the old columns don't count in the size below
 		c.queue_free()
 	_help_cols.add_child(_help_column(left))
 	_help_cols.add_child(_help_column(right))
@@ -1332,9 +1481,14 @@ func _terrain_help() -> Array:
 
 func _view_help() -> Array:
 	return ["View", [
-		["1-9", "select a squad (twice: go to it)"],
-		["Wheel, arrows", "zoom and pan; Home resets"],
+		["W A S D / arrows", "move the camera"],
+		["Hold right + drag", "pull the map around"],
+		["Q / E", "turn the camera left / right (3D)"],
+		["Wheel", "zoom (down to eye level); Home resets"],
 		["Middle-drag", "turn and tilt the camera (3D)"],
+		["Minimap", "click or drag to look there; M hides it"],
+		["1-9", "select a squad (twice: follow it)"],
+		["F", "follow the selected squad(s) (3D)"],
 		["F3", "switch 3D / 2D view"]]]
 
 
@@ -1362,6 +1516,8 @@ func _help_column(sections: Array) -> VBoxContainer:
 			grid.add_child(k)
 			var d := Label.new()
 			d.text = row[1]
+			d.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART # long ones wrap: the panel stays on screen
+			d.custom_minimum_size = Vector2(280, 0)
 			d.add_theme_font_size_override("font_size", 13)
 			d.add_theme_color_override("font_color", Color(0.9, 0.89, 0.84))
 			grid.add_child(d)
@@ -1394,18 +1550,41 @@ func _unhandled_input(event: InputEvent) -> void:
 				_dragging = false
 				_on_left_release(mouse, event.shift_pressed)
 		elif event.button_index == MOUSE_BUTTON_RIGHT:
-			if event.pressed and not selected.is_empty():
-				_rdragging = true
+			if event.pressed:
 				_rdrag_start = mouse
 				_rdrag_end = mouse
-			elif not event.pressed and _rdragging:
+				if _shifted() and not selected.is_empty():
+					_rdragging = true # Shift + drag: move and set facing
+				else:
+					_rpress = true
+					_rpanning = false
+					_rpress_screen = get_viewport().get_mouse_position()
+					if view3d != null:
+						view3d.begin_grab(_rpress_screen)
+			elif _rdragging:
 				_rdragging = false
 				_on_right_release(mouse)
+			elif _rpress:
+				_rpress = false
+				if not _rpanning:
+					_rdrag_start = mouse # a plain click: order / place here
+					_on_right_release(mouse)
+				_rpanning = false
 
 	elif event is InputEventMouseMotion:
 		if _panning and view3d == null:
 			cam.position -= event.relative / cam.zoom
 			_apply_camera()
+		if _rpress:
+			# Hold right and drag: grab the map and pull it
+			if not _rpanning and get_viewport().get_mouse_position().distance_to(_rpress_screen) >= PAN_THRESHOLD:
+				_rpanning = true
+			if _rpanning:
+				if view3d != null:
+					view3d.drag_grab(get_viewport().get_mouse_position())
+				else:
+					cam.position -= event.relative / cam.zoom
+					_apply_camera()
 		if _dragging:
 			_drag_end = _mouse_world()
 		if _rdragging:
@@ -1439,7 +1618,8 @@ func _on_left_release(mouse: Vector2, additive: bool) -> void:
 
 
 ## Right-click: move there (attack, if it's an enemy during battle).
-## Right-drag: move to where you pressed, facing the way you dragged.
+## Right-click: move / attack / place there. Shift+right-drag: move to where
+## you pressed, facing the way you dragged.
 func _on_right_release(mouse: Vector2) -> void:
 	if selected.is_empty():
 		return
@@ -1486,20 +1666,37 @@ func _on_key(key: Key) -> void:
 			if phase == Phase.PLANNING:
 				_zone_mode = not _zone_mode
 				_update_help()
+				if _zone_mode:
+					Guide.tip("zone")
 		KEY_A:
-			_assign_order(Action.ATTACK)
+			if _shifted():
+				_assign_order(Action.ATTACK)
 		KEY_R:
 			_assign_order(Action.RETREAT)
 		KEY_X:
 			_delete_zone_under_mouse()
 		KEY_Q:
-			_rotate_selected(-ROTATE_STEP)
+			if _shifted():
+				_rotate_selected(-ROTATE_STEP)
 		KEY_E:
-			_rotate_selected(ROTATE_STEP)
+			if _shifted():
+				_rotate_selected(ROTATE_STEP)
 		KEY_S:
-			_scout_under_mouse()
+			if _shifted():
+				_scout_under_mouse()
+		KEY_M:
+			if _minimap != null:
+				_minimap.get_parent().visible = not _minimap.get_parent().visible
 		KEY_H:
 			_toggle_hold()
+		KEY_F:
+			if view3d != null:
+				view3d.follow_selected(not view3d.following)
+
+
+## W A S D / Q E move and turn the camera; with Shift they're battle keys.
+func _shifted() -> bool:
+	return Input.is_key_pressed(KEY_SHIFT) or Input.is_key_pressed(KEY_CTRL)
 
 
 ## Selected squads ignore initiative and stay where they're put (toggle).
@@ -1528,6 +1725,7 @@ func _scout_under_mouse() -> void:
 	_popups.append({ "squad": e, "text": "Scouted: %s, %d soldiers" % [String(e.get_meta("role")).capitalize(), e.soldier_count], "left": POPUP_TIME })
 	Sound.play("scout")
 	_update_help()
+	Guide.tip("scouted")
 
 
 ## Planning only: turn each selected squad in place.
@@ -1648,6 +1846,10 @@ func _select(s: Squad) -> void:
 	if s not in selected:
 		selected.append(s)
 		s.selected = true
+	if s.team == 0:
+		Guide.tip("select")
+		if s.is_overloaded():
+			Guide.tip("overload")
 
 
 func _deselect(s: Squad) -> void:
@@ -1785,6 +1987,7 @@ func _issue(s: Squad, order: Dictionary) -> void:
 	order.left = delay
 	order.total = delay
 	pending.append(order)
+	Guide.tip("messenger")
 
 
 func _order_delay(s: Squad) -> float:
@@ -1990,6 +2193,17 @@ func _draw_objective(o: Dictionary) -> void:
 	draw_arc(p, OBJ_RADIUS, 0, TAU, 48, Color(OBJ_COLOR, 0.55) if not lost else Color(0.3, 0.25, 0.2, 0.6), 2.0)
 	if o.progress > 0.0 and not lost:
 		draw_arc(p, OBJ_RADIUS, -PI / 2, -PI / 2 + TAU * o.progress, 48, Color(1.0, 0.4, 0.2, 0.95), 5.0)
+	if not lost and (o.get("threat", false) or o.progress > 0.0):
+		var pulse := 0.5 + 0.5 * sin(Time.get_ticks_msec() / 160.0)
+		draw_arc(p, OBJ_RADIUS + 6.0 + pulse * 6.0, 0, TAU, 48, Color(1.0, 0.3, 0.2, 0.4 + 0.5 * pulse), 2.5)
+		var r = o.get("raider")
+		if r != null and is_instance_valid(r):
+			var from: Vector2 = r.center()
+			var dist := from.distance_to(p)
+			var k := 0.0
+			while k < dist - OBJ_RADIUS:
+				draw_line(from.lerp(p, k / dist), from.lerp(p, minf(k + 10.0, dist) / dist), Color(1.0, 0.35, 0.25, 0.8), 2.0)
+				k += 18.0
 	# Houses, upright
 	var t := Time.get_ticks_msec() / 1000.0
 	var houses := [Vector2(-22, -6), Vector2(14, -14), Vector2(4, 12)]
@@ -2030,6 +2244,9 @@ func squad_label(s: Squad, hovered: Squad) -> Array:
 		return ["RALLYING", Color(COMMANDER_COLOR, 0.95)]
 	var tags := []
 	var c := Color(0.85, 0.9, 1.0, 0.95)
+	if s.is_hidden():
+		tags.append("HIDDEN")
+		c = Color(0.6, 0.9, 0.6, 0.95)
 	if s.is_overloaded():
 		tags.append("OVERLOADED %d%%" % roundi(s.efficiency() * 100))
 		c = Color(1.0, 0.65, 0.35)

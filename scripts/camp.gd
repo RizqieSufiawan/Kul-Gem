@@ -77,8 +77,10 @@ func _ready() -> void:
 	footer.position = Vector2(20, 660)
 	footer.size = Vector2(1240, 40)
 	add_child(footer)
-	footer.add_child(_button("New campaign", _on_new_campaign, "quiet", 15))
-	var hint := _label("Hover a group to see who's in it.  Moving a group costs familiarity: less between similar leaders.", 12, QUIET)
+	var newc := _button("New campaign", _on_new_campaign, "quiet", 15)
+	newc.tooltip_text = "Start over from battle 1: new soldiers, 150 gold."
+	footer.add_child(newc)
+	var hint := _label("Hover anything to see what it does.   F1: guide", 12, QUIET)
 	hint.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	hint.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -87,6 +89,9 @@ func _ready() -> void:
 	_fill_all.tooltip_text = "Reserves first (free), then recruits"
 	footer.add_child(_fill_all)
 	var next := _button("Next battle   >", _on_next_battle, "main", 15)
+	next.tooltip_text = "March out. Each leader takes his fit soldiers; the wounded stay in camp."
+	Guide.tip_at(Vector2(28, 420)) # over the empty bottom of the Commander's column
+	Guide.tip("camp")
 	next.custom_minimum_size = Vector2(170, 40)
 	footer.add_child(next)
 
@@ -163,12 +168,14 @@ func _chip(text: String, fg: Color, bg := Color(1, 1, 1, 0.06), font_size := 12)
 
 
 ## Gold / Volunteers / Reserves in the header.
-func _pill(value: int, what: String, c: Color) -> Control:
+func _pill(value: int, what: String, c: Color, tip := "") -> Control:
 	var box := HBoxContainer.new()
 	box.add_theme_constant_override("separation", 6)
 	var p := PanelContainer.new()
 	p.add_theme_stylebox_override("panel", _flat(Color(1, 1, 1, 0.06), 6, 12, 4))
 	p.add_child(box)
+	p.tooltip_text = tip
+	p.mouse_filter = Control.MOUSE_FILTER_STOP
 	var v := _label(str(value), 18, c)
 	v.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	box.add_child(v)
@@ -205,9 +212,14 @@ func _refresh() -> void:
 
 	for c in _pills.get_children():
 		c.queue_free()
-	_pills.add_child(_pill(Campaign.gold, "gold", GOLD))
-	_pills.add_child(_pill(Campaign.recruit_pool, "volunteers", BLUE))
-	_pills.add_child(_pill(Campaign.reserves.size(), "reserves", INK))
+	_pills.add_child(_pill(Campaign.gold, "gold", GOLD,
+		"Gold. Recruits cost %d, healing a wounded man %d.\nAfter each battle: +%d victory / +%d defeat, +%d from the village,\n-1 per soldier (pay and food), -%d per burned place. Can't pay: men desert." % [
+		Campaign.RECRUIT_COST, Campaign.TREAT_COST, Campaign.REWARD_VICTORY, Campaign.REWARD_DEFEAT, Campaign.VILLAGE_LEVY, Campaign.BURN_GOLD]))
+	_pills.add_child(_pill(Campaign.recruit_pool, "volunteers", BLUE,
+		"Villagers willing to join. Each recruit uses one.\n+%d after a victory, +%d after a defeat, -%d for each burned place." % [
+		Campaign.POOL_REGROWTH, Campaign.POOL_REGROWTH_AFTER_DEFEAT, Campaign.BURN_VOLUNTEERS]))
+	_pills.add_child(_pill(Campaign.reserves.size(), "reserves", INK,
+		"Spare soldiers in no group (e.g. stand-ins whose wounded men came back).\nThey fill empty places for free, but still cost upkeep."))
 
 	_fill_ledger(r)
 
@@ -257,7 +269,10 @@ func _fill_ledger(r: Dictionary) -> void:
 	_ledger_people.add_child(_chip("Fallen  %d" % r.fallen.size(), BAD if r.fallen.size() > 0 else QUIET))
 	_ledger_people.add_child(_chip("Wounded  %d" % r.wounded.size(), WARN if r.wounded.size() > 0 else QUIET))
 	if not r.left_behind.is_empty():
-		_ledger_people.add_child(_chip("Left on the field  %d" % r.left_behind.size(), BAD))
+		var lb := _chip("Left on the field  %d" % r.left_behind.size(), BAD)
+		lb.tooltip_text = "We lost the field: half the wounded couldn't be carried back."
+		lb.mouse_filter = Control.MOUSE_FILTER_STOP
+		_ledger_people.add_child(lb)
 	var deserters: Array = r.get("deserters", [])
 	if not deserters.is_empty():
 		_ledger_people.add_child(_chip("Deserted  %d" % deserters.size(), BAD))
@@ -265,6 +280,9 @@ func _fill_ledger(r: Dictionary) -> void:
 	var burned: Array = r.get("burned", [])
 	if not burned.is_empty():
 		_ledger_people.add_child(_chip("Families left burned places  -%d volunteers" % (burned.size() * Campaign.BURN_VOLUNTEERS), BAD))
+	for w in r.get("wounded", []):
+		Guide.tip("wounded")
+		break
 	if r.get("to_reserve", 0) > 0:
 		_ledger_people.add_child(_chip("Stand-ins to the reserves  %d" % r.to_reserve, INK))
 
@@ -292,6 +310,12 @@ func _leader_column(l: Leader) -> Control:
 	var stats := HBoxContainer.new()
 	stats.add_theme_constant_override("separation", 4)
 	col.add_child(stats)
+	var stat_tips := {
+		"CMD": "Command: how many soldiers this leader leads well.\nMore than this = overloaded (fights and obeys worse).",
+		"CHA": "Charisma: the squad loses less morale when men fall.",
+		"TAC": "Tactics: orders are obeyed faster, and the squad\nnotices friends fighting from further away.",
+		"VAL": "Valor: the men hit harder.",
+	}
 	for pair in [["CMD", l.command], ["CHA", l.charisma], ["TAC", l.tactics], ["VAL", l.valor]]:
 		var cell := VBoxContainer.new()
 		cell.add_theme_constant_override("separation", -3)
@@ -306,10 +330,15 @@ func _leader_column(l: Leader) -> Control:
 		p.add_theme_stylebox_override("panel", _flat(Color(1, 1, 1, 0.04), 4, 4, 2))
 		p.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		p.add_child(cell)
+		p.tooltip_text = stat_tips[pair[0]]
+		p.mouse_filter = Control.MOUSE_FILTER_STOP
 		stats.add_child(p)
 
 	# Style and traits
-	col.add_child(_label(_style_text(l.style), 11, QUIET))
+	var style := _label(_style_text(l.style), 11, QUIET)
+	style.tooltip_text = "Leadership style. Men moved between leaders with\na similar style keep more of their familiarity."
+	style.mouse_filter = Control.MOUSE_FILTER_STOP
+	col.add_child(style)
 	var traits := HFlowContainer.new()
 	traits.add_theme_constant_override("h_separation", 4)
 	traits.add_theme_constant_override("v_separation", 4)
@@ -354,6 +383,9 @@ func _leader_column(l: Leader) -> Control:
 func _command_bar(fit: int, command: int) -> Control:
 	var v := VBoxContainer.new()
 	v.add_theme_constant_override("separation", 2)
+	v.tooltip_text = "Fit soldiers this leader takes into the next battle / his Command.%s" % (
+		"\nOVERLOADED: too many men. Move a group to a leader with room." if fit > command else "")
+	v.mouse_filter = Control.MOUSE_FILTER_STOP
 	var row := HBoxContainer.new()
 	v.add_child(row)
 	row.add_child(_label("Leads next battle", 11, QUIET))
@@ -366,6 +398,7 @@ func _command_bar(fit: int, command: int) -> Control:
 	bar.show_percentage = false
 	bar.custom_minimum_size = Vector2(0, 5)
 	bar.max_value = maxi(command, fit)
+	bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	bar.value = fit
 	bar.add_theme_stylebox_override("background", _flat(Color(1, 1, 1, 0.07), 2, 0, 0))
 	bar.add_theme_stylebox_override("fill", _flat(WARN if over else GOOD.darkened(0.15), 2, 0, 0))
@@ -414,21 +447,30 @@ func _group_box(g: Dictionary) -> Control:
 		tags.add_theme_constant_override("separation", 4)
 		v.add_child(tags)
 		if hurt > 0:
-			tags.add_child(_chip("%d wounded" % hurt, WARN, Color(WARN, 0.12), 11))
+			var wc := _chip("%d wounded" % hurt, WARN, Color(WARN, 0.12), 11)
+			wc.tooltip_text = "Wounded men sit out 1-2 battles but keep their place.\nTreat them to have them back now."
+			wc.mouse_filter = Control.MOUSE_FILTER_STOP
+			tags.add_child(wc)
 		if gaps > 0:
-			tags.add_child(_chip("%d empty" % gaps, BAD, Color(BAD, 0.12), 11))
+			var ec := _chip("%d empty" % gaps, BAD, Color(BAD, 0.12), 11)
+			ec.tooltip_text = "Empty places (the men died or deserted).\nFill them with reserves (free) or recruits."
+			ec.mouse_filter = Control.MOUSE_FILTER_STOP
+			tags.add_child(ec)
 
 	if gaps > 0 and not Campaign.reserves.is_empty():
 		var nr := mini(gaps, Campaign.reserves.size())
-		v.add_child(_button("Take %d from reserves   (free)" % nr, func() -> void:
+		var tr := _button("Take %d from reserves   (free)" % nr, func() -> void:
 			Campaign.reserves_into(g, gaps)
-			_refresh()))
+			_refresh())
+		tr.tooltip_text = "Spare soldiers join this group for free.\nThey start with half their familiarity (a new leader)."
+		v.add_child(tr)
 	elif gaps > 0:
 		var n := Campaign.affordable(gaps)
 		var b := _button("Recruit %d   (%d gold)" % [n, n * Campaign.RECRUIT_COST] if n > 0 else "Can't afford recruits", func() -> void:
 			Campaign.recruit_into(g, gaps)
 			_refresh())
 		b.disabled = n == 0
+		b.tooltip_text = "New villagers fill the empty places: %d gold each.\nThey start with no familiarity (no stars)." % Campaign.RECRUIT_COST
 		v.add_child(b)
 	if hurt > 0:
 		var nt := mini(hurt, Campaign.gold / Campaign.TREAT_COST)
@@ -453,6 +495,8 @@ func _group_box(g: Dictionary) -> Control:
 	var move := MenuButton.new()
 	move.text = "Move to another leader  ▾"
 	move.flat = true
+	move.tooltip_text = "Give this whole group to another leader (e.g. to fix an overloaded squad).\nThe men lose some familiarity; less if the leaders' styles are alike."
+
 	move.alignment = HORIZONTAL_ALIGNMENT_LEFT
 	move.add_theme_font_size_override("font_size", 11)
 	move.add_theme_color_override("font_color", QUIET)
@@ -467,7 +511,7 @@ func _group_box(g: Dictionary) -> Control:
 		Campaign.move_group(g, Campaign.leader_by_id(id))
 		_refresh())
 	v.add_child(move)
-	box.tooltip_text = "\n".join(names) if not names.is_empty() else "Empty"
+	box.tooltip_text = ("Group %d: %d fit of %d places\n\n" % [g.id, fit, g.size]) + ("\n".join(names) if not names.is_empty() else "Empty")
 	return box
 
 

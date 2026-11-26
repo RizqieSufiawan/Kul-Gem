@@ -3,7 +3,8 @@ extends Node3D
 ## flat 2D map (pixels); this only draws it in 3D: 1 map px = S world units,
 ## hills from Terrain.height, the stream carved into the ground.
 ##
-## Camera: WASD / arrows pan, Q / E turn, wheel zoom, middle-drag orbit, Home reset.
+## Camera: WASD / arrows pan, Q / E turn, wheel zoom (toward the cursor, from
+## the whole map down to eye level), middle-drag turn / tilt, Home reset.
 
 const S := 0.05 # world units per map pixel
 const HILL_H := 2.6
@@ -12,6 +13,27 @@ const WATER_Y := -0.2
 const CELL := 6.0 # map px per terrain grid cell
 const MARGIN := 320.0 # ground beyond the map edge, so the horizon isn't a cliff
 const MAX_CORPSES := 600
+const MIN_DIST := 2.2 # closest zoom: among the men
+
+# --- Art direction ----------------------------------------------------------------
+# The world is muted and misty, like a storybook picture (Bad North); only what
+# you have to read is strong colour: the squads, banners and village flags
+# (Thronefall); many small, chunky soldiers rather than a few detailed ones
+# (Diplomacy is Not an Option). Environment colours live here.
+const MIST := Color(0.86, 0.86, 0.82) # fog, horizon, the map's edge dissolving
+const GRASS_A := Color(0.43, 0.55, 0.32)
+const GRASS_B := Color(0.5, 0.6, 0.36)
+const FOREST_FLOOR := Color(0.33, 0.41, 0.29)
+const ROAD := Color(0.68, 0.6, 0.46)
+const MUD := Color(0.47, 0.41, 0.32)
+const FORD := Color(0.72, 0.68, 0.55)
+const CROWN_A := Color(0.33, 0.47, 0.31)
+const CROWN_B := Color(0.45, 0.56, 0.36)
+const PINE_A := Color(0.21, 0.35, 0.29)
+const PINE_B := Color(0.28, 0.42, 0.33)
+const TRUNK := Color(0.42, 0.35, 0.28)
+const STONE := Color(0.74, 0.73, 0.68)
+const MAX_DIST := 90.0 # farthest: the whole map
 
 var sim # the skirmish (untyped: it preloads this script)
 var cam: Camera3D
@@ -19,6 +41,12 @@ var target := Vector3.ZERO
 var yaw := 0.0
 var pitch := deg_to_rad(55.0)
 var dist := 44.0
+var tilt := 0.0 # the player's tilt on top of the zoom's own angle
+var dist_goal := 44.0 # zoom and pan ease toward these
+var target_goal := Vector3.ZERO
+var yaw_touched := false # the player turned the camera (followers stop steering it)
+var _pan_vel := Vector2.ZERO # keys ease in and out instead of starting and stopping dead
+var _turn_vel := 0.0
 var overlay: Control
 var _orbiting := false
 var _decals := ImmediateMesh.new()
@@ -27,6 +55,7 @@ var _corpse_mm: MultiMesh
 var _corpses: Array[Dictionary] = [] # { pos: Vector2, color: Color, face: Vector2 }
 var _font: Font
 var _cam_attr: CameraAttributesPractical # depth of field (Forward+ only)
+var _env: Environment
 
 
 func _init(skirmish) -> void:
@@ -47,7 +76,8 @@ func _ready() -> void:
 	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(mi)
 	cam = Camera3D.new()
-	cam.fov = 45.0
+	cam.fov = 50.0
+	cam.near = 0.03
 	cam.far = 400.0
 	cam.attributes = _cam_attr
 	add_child(cam)
@@ -103,6 +133,20 @@ func pick(screen: Vector2) -> Vector2:
 	return mp
 
 
+## Where a screen point's ray meets the ground (on flat ground at height 0;
+## rays at or above the horizon stop a fixed distance out). For the minimap.
+func ground_hit(screen: Vector2) -> Vector2:
+	var o := cam.project_ray_origin(screen)
+	var d := cam.project_ray_normal(screen)
+	var hit: Vector3
+	if d.y > -0.03:
+		var flat := Vector3(d.x, 0, d.z).normalized()
+		hit = o + flat * 90.0
+	else:
+		hit = o + d * minf((0.0 - o.y) / d.y, 90.0 / maxf(Vector2(d.x, d.z).length(), 0.01))
+	return Vector2(hit.x / S, hit.z / S)
+
+
 func to_screen(p: Vector2, lift := 0.45) -> Vector2:
 	return cam.unproject_position(ground(p, lift))
 
@@ -129,20 +173,63 @@ func enemy_at_screen(screen: Vector2, team: int):
 
 func reset_camera() -> void:
 	target = Vector3(View.MAP_SIZE.x * S / 2.0, 0.0, View.MAP_SIZE.y * S / 2.0 + 2.0)
+	target_goal = target
 	yaw = 0.0
-	pitch = deg_to_rad(55.0)
+	tilt = 0.0
 	dist = 44.0
+	dist_goal = dist
 	_place_camera()
 
 
+## How far up the camera looks down at a given zoom: steep from high up,
+## nearly level when it's down among the men.
+func _zoom_t(d: float) -> float:
+	return clampf(inverse_lerp(log(3.0), log(60.0), log(d)), 0.0, 1.0)
+
+
 func _place_camera() -> void:
-	var off := Vector3(sin(yaw) * cos(pitch), sin(pitch), cos(yaw) * cos(pitch)) * dist
-	cam.position = target + off
-	cam.look_at(target, Vector3.UP)
+	var zt := _zoom_t(dist)
+	pitch = clampf(lerpf(deg_to_rad(8.0), deg_to_rad(60.0), zt) + tilt, deg_to_rad(2.0), deg_to_rad(85.0))
+	var mp := Vector2(target.x / S, target.z / S)
+	# Look at the ground there (at chest height when close)
+	var aim := Vector3(target.x, height_at(mp) + lerpf(0.75, 0.0, zt), target.z)
+	var pos := aim + Vector3(sin(yaw) * cos(pitch), sin(pitch), cos(yaw) * cos(pitch)) * dist
+	pos.y = maxf(pos.y, height_at(Vector2(pos.x / S, pos.z / S)) + 0.3) # never inside a hill
+	cam.position = pos
+	cam.look_at(aim, Vector3.UP)
+	if _env != null:
+		# The mist starts a little beyond what you're looking at
+		_env.fog_depth_begin = dist * 1.4 + 18.0
+		_env.fog_depth_end = _env.fog_depth_begin + 110.0
 	if _cam_attr != null:
 		# A touch of blur in the distance: the field looks like a table-top model
-		_cam_attr.dof_blur_far_distance = dist * 1.5
-		_cam_attr.dof_blur_far_transition = dist * 1.2
+		_cam_attr.dof_blur_far_distance = maxf(dist * 1.5, 18.0)
+		_cam_attr.dof_blur_far_transition = maxf(dist * 1.2, 14.0)
+
+
+## Zoom by `f` (<1 = in). Zooming in heads toward the cursor.
+func _zoom(f: float, screen: Vector2) -> void:
+	var before := dist_goal
+	dist_goal = clampf(dist_goal * f, MIN_DIST, MAX_DIST)
+	if f < 1.0:
+		var p := pick(screen)
+		var g := Vector3(p.x * S, 0.0, p.y * S)
+		if g.distance_to(target_goal) < maxf(dist_goal, 4.0) * 3.0: # not a point on the horizon
+			target_goal += (g - target_goal) * (1.0 - dist_goal / before)
+			_clamp_goal()
+
+
+func _clamp_goal() -> void:
+	target_goal.x = clampf(target_goal.x, 0.0, View.MAP_SIZE.x * S)
+	target_goal.z = clampf(target_goal.z, 0.0, View.MAP_SIZE.y * S)
+
+
+## Glide zoom and pan to where they're headed.
+func _ease_camera(delta: float) -> void:
+	var k := 1.0 - exp(-delta * 9.0)
+	dist = lerpf(dist, dist_goal, k)
+	target = target.lerp(target_goal, k)
+	_place_camera()
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -150,17 +237,17 @@ func _unhandled_input(event: InputEvent) -> void:
 		match event.button_index:
 			MOUSE_BUTTON_WHEEL_UP:
 				if event.pressed:
-					dist = clampf(dist / 1.12, 8.0, 80.0)
-					_place_camera()
+					_zoom(1.0 / 1.18, event.position)
 			MOUSE_BUTTON_WHEEL_DOWN:
 				if event.pressed:
-					dist = clampf(dist * 1.12, 8.0, 80.0)
-					_place_camera()
+					_zoom(1.18, event.position)
 			MOUSE_BUTTON_MIDDLE:
 				_orbiting = event.pressed
 	elif event is InputEventMouseMotion and _orbiting:
 		yaw -= event.relative.x * 0.008
-		pitch = clampf(pitch + event.relative.y * 0.006, deg_to_rad(20.0), deg_to_rad(85.0))
+		tilt = clampf(tilt + event.relative.y * 0.005, -0.7, 0.7)
+		if event.relative.x != 0.0:
+			yaw_touched = true
 		_place_camera()
 	elif event is InputEventKey and event.pressed and event.keycode == KEY_HOME:
 		reset_camera()
@@ -171,13 +258,30 @@ func _camera_keys(delta: float) -> void:
 		float(Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT)) - float(Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT)),
 		float(Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN)) - float(Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP)))
 	var turn := float(Input.is_key_pressed(KEY_E)) - float(Input.is_key_pressed(KEY_Q))
-	if move == Vector2.ZERO and turn == 0.0:
-		return
-	yaw += turn * 1.6 * delta
-	var speed := dist * 0.9 * delta
+	_drive(move, turn, delta)
+
+
+## Pan and turn with a little momentum. E turns right, Q left.
+func _drive(move: Vector2, turn: float, delta: float) -> void:
+	var k := 1.0 - exp(-delta * 10.0)
+	_pan_vel = _pan_vel.lerp(move.limit_length(1.0), k)
+	_turn_vel = lerpf(_turn_vel, turn * 1.9, k)
+	if turn != 0.0:
+		yaw_touched = true
+	if absf(_turn_vel) > 0.01:
+		yaw -= _turn_vel * delta
+	if _pan_vel.length() > 0.01:
+		_pan(_pan_vel, delta)
+
+
+func _pan(move: Vector2, delta: float) -> void:
+	var speed := maxf(dist, 4.0) * 0.9 * delta
 	var right := Vector3(cos(yaw), 0, -sin(yaw))
 	var back := Vector3(sin(yaw), 0, cos(yaw))
-	target += (right * move.x + back * move.y) * speed
+	var step := (right * move.x + back * move.y) * speed
+	target_goal += step
+	target += step
+	_clamp_goal()
 	target.x = clampf(target.x, 0.0, View.MAP_SIZE.x * S)
 	target.z = clampf(target.z, 0.0, View.MAP_SIZE.y * S)
 	_place_camera()
@@ -197,43 +301,53 @@ func _build_environment() -> void:
 	env.background_mode = Environment.BG_SKY
 	var sky := Sky.new()
 	var sky_mat := ProceduralSkyMaterial.new()
-	sky_mat.sky_top_color = Color(0.32, 0.5, 0.74)
-	sky_mat.sky_horizon_color = Color(0.74, 0.78, 0.76)
-	sky_mat.ground_horizon_color = Color(0.5, 0.55, 0.45)
-	sky_mat.ground_bottom_color = Color(0.25, 0.3, 0.2)
+	sky_mat.sky_top_color = Color(0.55, 0.67, 0.78)
+	sky_mat.sky_horizon_color = MIST
+	sky_mat.ground_horizon_color = MIST
+	sky_mat.ground_bottom_color = MIST.darkened(0.2)
 	sky_mat.sun_angle_max = 30.0
 	sky.sky_material = sky_mat
 	env.sky = sky
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
 	var sun := DirectionalLight3D.new()
 	sun.rotation = Vector3(deg_to_rad(-42.0), deg_to_rad(-35.0), 0.0)
-	sun.light_color = Color(1.0, 0.94, 0.84)
+	sun.light_color = Color(1.0, 0.93, 0.82)
 	sun.shadow_enabled = true
 	sun.directional_shadow_max_distance = 110.0
 	if _rich():
-		env.ambient_light_energy = 0.55
-		env.tonemap_mode = Environment.TONE_MAPPER_ACES
-		env.tonemap_exposure = 1.05
+		env.ambient_light_energy = 0.75 # soft shadows, nothing pitch dark
+		env.tonemap_mode = Environment.TONE_MAPPER_AGX
+		env.tonemap_exposure = 1.0
 		env.ssao_enabled = true
-		env.ssao_radius = 1.2
-		env.ssao_intensity = 1.6
+		env.ssao_radius = 1.5
+		env.ssao_intensity = 1.0
 		env.glow_enabled = true
-		env.glow_intensity = 0.35
-		env.glow_bloom = 0.04
+		env.glow_intensity = 0.3
+		env.glow_bloom = 0.05
+		# Mist by distance: clear where you look, the far field dissolving
 		env.fog_enabled = true
-		env.fog_light_color = Color(0.72, 0.78, 0.82)
-		env.fog_density = 0.0035
-		env.fog_aerial_perspective = 0.4
+		env.fog_mode = Environment.FOG_MODE_DEPTH
+		env.fog_light_color = MIST
+		env.fog_density = 1.0
+		env.fog_depth_curve = 1.6
+		env.fog_aerial_perspective = 0.3
+		env.fog_sky_affect = 0.7
 		env.adjustment_enabled = true
-		env.adjustment_saturation = 1.12
-		env.adjustment_contrast = 1.05
-		sun.light_energy = 1.35
-		sun.shadow_blur = 1.5
+		env.adjustment_saturation = 1.1
+		env.adjustment_contrast = 1.0
+		sun.light_energy = 1.3
+		sun.shadow_blur = 2.5
 		sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
 	else:
-		env.ambient_light_energy = 0.4
+		env.ambient_light_energy = 0.5
 		env.tonemap_mode = Environment.TONE_MAPPER_LINEAR
+		env.fog_enabled = true # the plain renderer gets the same mist by distance
+		env.fog_mode = Environment.FOG_MODE_DEPTH
+		env.fog_light_color = MIST
+		env.fog_density = 1.0
+		env.fog_depth_curve = 1.6
 		sun.light_energy = 0.85
+	_env = env
 	var we := WorldEnvironment.new()
 	we.environment = env
 	add_child(we)
@@ -247,17 +361,20 @@ func _build_environment() -> void:
 
 func _ground_color(p: Vector2, noise: FastNoiseLite) -> Color:
 	var n := noise.get_noise_2d(p.x, p.y)
-	var c := Color(0.36, 0.5, 0.24).lerp(Color(0.42, 0.55, 0.27), n * 0.5 + 0.5)
-	c = c.lightened(Terrain.height(p) * 0.12)
+	var c := GRASS_A.lerp(GRASS_B, n * 0.5 + 0.5)
+	c = c.lightened(Terrain.height(p) * 0.1)
 	if Terrain.in_forest(p):
-		c = Color(0.22, 0.33, 0.17).lerp(c, 0.25)
+		c = FOREST_FLOOR.lerp(c, 0.3)
 	if Terrain.on_road(p):
 		var edge := absf(p.y - Terrain.road_y(p.x)) / Terrain.ROAD_HALF_WIDTH
-		c = Color(0.52, 0.43, 0.3).lerp(c, smoothstep(0.7, 1.0, edge))
+		c = ROAD.lerp(c, smoothstep(0.7, 1.0, edge))
 	var carve := _carve(p)
 	if carve > 0.0:
-		var mud := Color(0.62, 0.56, 0.4) if _near_ford(p) else Color(0.34, 0.29, 0.21)
-		c = c.lerp(mud, clampf(carve / 0.12, 0.0, 1.0))
+		c = c.lerp(FORD if _near_ford(p) else MUD, clampf(carve / 0.12, 0.0, 1.0))
+	# Past the edge of the map the land fades into the mist
+	var out := maxf(maxf(-p.x, p.x - View.MAP_SIZE.x), maxf(-p.y, p.y - View.MAP_SIZE.y))
+	if out > 0.0:
+		c = c.lerp(MIST, smoothstep(0.0, MARGIN * 0.8, out))
 	return c
 
 
@@ -327,9 +444,9 @@ void vertex() {
 void fragment() {
 	float n1 = texture(detail, wpos.xz * 0.11).r;
 	float n2 = texture(detail, wpos.xz * 0.53).r;
-	ALBEDO = base * (0.82 + 0.3 * n1) * (0.92 + 0.16 * n2);
-	ROUGHNESS = 0.95;
-	SPECULAR = 0.2;
+	ALBEDO = base * (0.9 + 0.16 * n1) * (0.96 + 0.08 * n2); // a soft painted grain, not texture
+	ROUGHNESS = 1.0;
+	SPECULAR = 0.1;
 }
 """
 	var noise := FastNoiseLite.new()
@@ -353,8 +470,8 @@ func _water_material() -> ShaderMaterial:
 	sh.code = """
 shader_type spatial;
 render_mode blend_mix, cull_disabled, depth_draw_always;
-uniform vec3 deep : source_color = vec3(0.10, 0.27, 0.38);
-uniform vec3 shallow : source_color = vec3(0.26, 0.50, 0.56);
+uniform vec3 deep : source_color = vec3(0.24, 0.4, 0.47);
+uniform vec3 shallow : source_color = vec3(0.48, 0.64, 0.64);
 varying vec3 wpos;
 void vertex() {
 	wpos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
@@ -366,11 +483,11 @@ void fragment() {
 	NORMAL_MAP = normalize(vec3(0.5 + 0.025 * b, 0.5 + 0.035 * a, 1.0));
 	float edge = abs(UV.x - 0.5) * 2.0; // 0 mid-stream, 1 at the banks
 	float fres = pow(1.0 - clamp(dot(NORMAL, VIEW), 0.0, 1.0), 4.0);
-	ALBEDO = mix(deep, shallow, edge * 0.7 + 0.15 * a) + vec3(0.25) * fres;
-	ALPHA = mix(0.78, 0.96, fres) * mix(1.0, 0.85, edge);
-	ROUGHNESS = 0.06;
+	ALBEDO = mix(deep, shallow, edge * 0.7 + 0.15 * a) + vec3(0.18) * fres;
+	ALPHA = mix(0.82, 0.96, fres) * mix(1.0, 0.88, edge);
+	ROUGHNESS = 0.2;
 	METALLIC = 0.0;
-	SPECULAR = 0.8;
+	SPECULAR = 0.45;
 }
 """
 	var m := ShaderMaterial.new()
@@ -457,12 +574,42 @@ func _multimesh(mesh: Mesh, count: int, mat: Material, shadows := true) -> Multi
 	return mm
 
 
+## Several primitive meshes baked into one, each placed by its transform
+## and painted with its own colour (which the instance colour then tints).
+## parts: [[PrimitiveMesh, Transform3D, Color], ...]
+func _compose(parts: Array) -> ArrayMesh:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	for part in parts:
+		var arr: Array = (part[0] as PrimitiveMesh).get_mesh_arrays()
+		var xf: Transform3D = part[1]
+		var nb := xf.basis.inverse().transposed()
+		var verts: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
+		var norms: PackedVector3Array = arr[Mesh.ARRAY_NORMAL]
+		var idx: PackedInt32Array = arr[Mesh.ARRAY_INDEX]
+		for i in idx:
+			st.set_color(part[2])
+			st.set_normal((nb * norms[i]).normalized())
+			st.add_vertex(xf * verts[i])
+	return st.commit()
+
+
 func _colored(roughness := 0.85, metallic := 0.0) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
 	m.vertex_color_use_as_albedo = true
 	m.vertex_color_is_srgb = true # our colours are picked by eye, in sRGB
 	m.roughness = roughness
 	m.metallic = metallic
+	return m
+
+
+## For the squads: a soft rim of light so the team colours pop off the
+## muted ground (the readability rule).
+func _unit_mat(roughness := 0.8, metallic := 0.0) -> StandardMaterial3D:
+	var m := _colored(roughness, metallic)
+	m.rim_enabled = true
+	m.rim = 0.35
+	m.rim_tint = 0.6
 	return m
 
 
@@ -511,9 +658,9 @@ func _build_trees_and_stones() -> void:
 		var sc := rng.randf_range(0.55, 0.85)
 		var base := ground(p)
 		trunks.set_instance_transform(ti, Transform3D(Basis().scaled(Vector3.ONE * sc), base + Vector3(0, 0.45 * sc, 0)))
-		trunks.set_instance_color(ti, Color(0.36, 0.26, 0.17))
+		trunks.set_instance_color(ti, TRUNK)
 		ti += 1
-		var green := Color(0.16, 0.36, 0.17).lerp(Color(0.3, 0.48, 0.2), rng.randf())
+		var green := CROWN_A.lerp(CROWN_B, rng.randf())
 		crowns.set_instance_transform(k * 2, Transform3D(Basis().scaled(Vector3.ONE * sc), base + Vector3(0, 1.3 * sc, 0)))
 		crowns.set_instance_color(k * 2, green)
 		var off := Vector3(rng.randf_range(-0.3, 0.3), 0, rng.randf_range(-0.3, 0.3)) * sc
@@ -524,9 +671,9 @@ func _build_trees_and_stones() -> void:
 		var sc := rng.randf_range(0.6, 0.95)
 		var base := ground(p)
 		trunks.set_instance_transform(ti, Transform3D(Basis().scaled(Vector3.ONE * sc), base + Vector3(0, 0.45 * sc, 0)))
-		trunks.set_instance_color(ti, Color(0.32, 0.22, 0.14))
+		trunks.set_instance_color(ti, TRUNK.darkened(0.1))
 		ti += 1
-		var green := Color(0.1, 0.27, 0.16).lerp(Color(0.17, 0.36, 0.2), rng.randf())
+		var green := PINE_A.lerp(PINE_B, rng.randf())
 		for j in 3:
 			var shrink := 1.0 - j * 0.25
 			cones.set_instance_transform(k * 3 + j, Transform3D(Basis().scaled(Vector3(shrink, 1.0, shrink) * sc), base + Vector3(0, (0.85 + j * 0.45) * sc, 0)))
@@ -547,7 +694,7 @@ func _build_trees_and_stones() -> void:
 	for i in stones.size():
 		var sc := rng.randf_range(0.6, 1.8)
 		smm.set_instance_transform(i, Transform3D(Basis().rotated(Vector3.UP, rng.randf() * TAU).scaled(Vector3(sc, sc * 0.7, sc)), ground(stones[i], 0.02)))
-		smm.set_instance_color(i, Color(0.55, 0.55, 0.52).darkened(rng.randf() * 0.2))
+		smm.set_instance_color(i, STONE.darkened(rng.randf() * 0.15))
 
 
 ## Thousands of grass tufts that sway in the wind (none on the road, in
@@ -573,8 +720,8 @@ func _build_grass() -> void:
 	sh.code = """
 shader_type spatial;
 render_mode cull_disabled, specular_disabled;
-uniform vec3 root : source_color = vec3(0.3, 0.45, 0.2);
-uniform vec3 tip : source_color = vec3(0.55, 0.7, 0.32);
+uniform vec3 root : source_color = vec3(0.4, 0.5, 0.32);
+uniform vec3 tip : source_color = vec3(0.64, 0.7, 0.46);
 varying vec3 tint;
 void vertex() {
 	tint = COLOR.rgb;
@@ -603,6 +750,8 @@ void fragment() {
 			continue
 		if Terrain.in_forest(p) and rng.randf() < 0.7:
 			continue
+		if _grass_thin(p) and rng.randf() < 0.8:
+			continue
 		spots.append(Vector3(p.x, p.y, rng.randf()))
 	var mm := _multimesh(tuft, spots.size(), mat, false)
 	for i in spots.size():
@@ -610,6 +759,11 @@ void fragment() {
 		var sc := rng.randf_range(0.7, 1.3)
 		mm.set_instance_transform(i, Transform3D(Basis(Vector3.UP, rng.randf() * TAU).scaled(Vector3.ONE * sc), ground(p)))
 		mm.set_instance_color(i, Color(1, 1, 1).lerp(Color(1.15, 1.05, 0.8), spots[i].z * 0.6))
+
+
+## Where the grass grows sparse (the battle view thins it in the villages).
+func _grass_thin(_p: Vector2) -> bool:
+	return false
 
 
 func _build_soldiers() -> void:
@@ -656,7 +810,9 @@ func add_corpse(p: Vector2, color: Color, face: Vector2) -> void:
 # --- Every frame ------------------------------------------------------------------
 
 func _process(delta: float) -> void:
-	_camera_keys(delta)
+	if not Guide.is_open:
+		_camera_keys(delta)
+	_ease_camera(delta)
 	_update_soldiers()
 	_update_decals()
 	if overlay != null:

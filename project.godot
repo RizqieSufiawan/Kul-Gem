@@ -18,6 +18,7 @@ config/features=PackedStringArray("4.7", "GL Compatibility")
 
 Campaign="*res://scripts/campaign.gd"
 Sound="*res://scripts/sound.gd"
+Guide="*res://scripts/guide.gd"
 
 [display]
 
@@ -31,9 +32,8 @@ project/assembly_name="ThinLine"
 
 [rendering]
 
-renderer/rendering_method="forward_plus"
 renderer/rendering_method.mobile="gl_compatibility"
-anti_aliasing/quality/msaa_3d=2
-lights_and_shadows/directional_shadow/size=4096
+renderer/rendering_method.web="gl_compatibility"
 lights_and_shadows/directional_shadow/soft_shadow_filter_quality=3
 textures/default_filters/anisotropic_filtering_level=3
+anti_aliasing/quality/msaa_3d=2
